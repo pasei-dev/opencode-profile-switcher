@@ -50,18 +50,36 @@ export default Plugin.define({
     /** Every registration, disposed on unload so hot-reloads do not stack. */
     const registrations: Array<{ dispose(): Promise<void> | void }> = []
 
+    // Host/SDK skew guard: the plugin SDK declares domains that older hosts do
+    // not provide at runtime (host 2.0.4 has no ctx.catalog, which used to
+    // crash setup entirely). Probe each domain once, warn once, and degrade:
+    // related profile keys stay on the base config instead of taking the whole
+    // plugin down.
+    const missing = new Set<string>()
+    const domain = <K extends keyof typeof ctx>(name: K): (typeof ctx)[K] | undefined => {
+      const key = name as string
+      const value = (ctx as unknown as Record<string, unknown>)[key]
+      if (value === undefined || value === null) {
+        if (!missing.has(key)) {
+          missing.add(key)
+          console.warn(`[profile-switcher] host provides no ctx.${key}; related profile keys stay on base config`)
+        }
+        return undefined
+      }
+      return value as (typeof ctx)[K]
+    }
+    const session = domain("session")
+
     const refresh = async () => {
       profiles = loadProfiles()
     }
 
     const reloadAll = async () => {
-      await Promise.all([
-        ctx.agent.reload(),
-        ctx.catalog.reload(),
-        ctx.mcp.reload(),
-        ctx.reference.reload(),
-        ctx.websearch.reload(),
-      ])
+      const reloaders: Array<() => Promise<void>> = []
+      for (const d of [domain("agent"), domain("catalog"), domain("mcp"), domain("reference"), domain("websearch")]) {
+        if (d) reloaders.push(() => d.reload())
+      }
+      await Promise.all(reloaders.map((reload) => reload()))
     }
 
     const select = (name: string | null) => {
@@ -102,7 +120,7 @@ export default Plugin.define({
     // Disabled agents are only hidden, so this never strands a session; it just
     // points the session at the agent/model the profile intends.
     const migrateSession = async (sessionID?: string) => {
-      if (!sessionID) return
+      if (!sessionID || !session) return
       const target = active ? { agent: active.defaultAgent, model: sessionModel() } : baseTarget()
 
       // This plugin loads once per location but the handoff file is global, so
@@ -113,7 +131,7 @@ export default Plugin.define({
       let currentAgent: unknown
       let currentModel: { providerID?: unknown; id?: unknown } | undefined
       try {
-        const info = (await ctx.session.get({ sessionID })) as any
+        const info = (await session.get({ sessionID })) as any
         const sessionDir = info?.location?.directory
         const ownDir = (ctx.location as { directory?: unknown } | undefined)?.directory
         if (typeof sessionDir === "string" && typeof ownDir === "string" && sessionDir !== ownDir) return
@@ -125,7 +143,7 @@ export default Plugin.define({
 
       if (target.agent && target.agent !== currentAgent) {
         try {
-          await ctx.session.switchAgent({ sessionID, agent: target.agent })
+          await session.switchAgent({ sessionID, agent: target.agent })
         } catch (error) {
           console.warn("[profile-switcher] could not move session to profile agent", error)
         }
@@ -135,7 +153,7 @@ export default Plugin.define({
         (target.model.providerID !== currentModel?.providerID || target.model.id !== currentModel?.id)
       ) {
         try {
-          await ctx.session.switchModel({ sessionID, model: target.model })
+          await session.switchModel({ sessionID, model: target.model })
         } catch (error) {
           console.warn("[profile-switcher] could not switch session model", error)
         }
@@ -156,8 +174,9 @@ export default Plugin.define({
 
     // --- agents ------------------------------------------------------------
 
-    registrations.push(
-      await ctx.agent.transform((draft) => {
+    if (domain("agent")) {
+      registrations.push(
+        await domain("agent")!.transform((draft) => {
         // Transforms replay onto a fresh registry, so nothing a previous profile
         // changed can survive into this one: base agents come back exactly as
         // configured. That is what makes `/profile none` restore `build` — the
@@ -216,42 +235,51 @@ export default Plugin.define({
             agent.hidden = true
           })
         }
-      }),
-    )
+        }),
+      )
+    }
 
     // --- models and MCP ----------------------------------------------------
 
-    registrations.push(
-      await ctx.catalog.transform((catalog) => {
-        const ref = active?.defaultModel ? parseModelRef(active.defaultModel) : undefined
-        if (ref) catalog.model.default.set(ref.providerID, ref.id)
-      }),
-    )
+    if (domain("catalog")) {
+      registrations.push(
+        await domain("catalog")!.transform((catalogDraft) => {
+          const ref = active?.defaultModel ? parseModelRef(active.defaultModel) : undefined
+          if (ref) catalogDraft.model.default.set(ref.providerID, ref.id)
+        }),
+      )
+    }
 
-    registrations.push(
-      await ctx.mcp.transform((draft) => {
-        if (!active) return
-        for (const [name, server] of Object.entries(mcpServers(active.config))) draft.set(name, server)
-      }),
-    )
+    if (domain("mcp")) {
+      registrations.push(
+        await domain("mcp")!.transform((draft) => {
+          if (!active) return
+          for (const [name, server] of Object.entries(mcpServers(active.config))) draft.set(name, server)
+        }),
+      )
+    }
 
     // Named references: replayed onto a fresh registry, so the previous
     // profile's entries disappear without any bookkeeping here.
-    registrations.push(
-      await ctx.reference.transform((draft) => {
-        if (!active) return
-        for (const [name, source] of Object.entries(referenceSources(active.config, active.directory)))
-          draft.add(name, source)
-      }),
-    )
+    if (domain("reference")) {
+      registrations.push(
+        await domain("reference")!.transform((draft) => {
+          if (!active) return
+          for (const [name, source] of Object.entries(referenceSources(active.config, active.directory)))
+            draft.add(name, source)
+        }),
+      )
+    }
 
     // websearch is selection only: an id, or false to turn it off.
-    registrations.push(
-      await ctx.websearch.transform((draft) => {
-        const selection = active ? websearchSelection(active.config) : undefined
-        if (selection !== undefined) draft.default.set(selection)
-      }),
-    )
+    if (domain("websearch")) {
+      registrations.push(
+        await domain("websearch")!.transform((draft) => {
+          const selection = active ? websearchSelection(active.config) : undefined
+          if (selection !== undefined) draft.default.set(selection)
+        }),
+      )
+    }
 
     // --- permissions -------------------------------------------------------
     // There is no ruleset transform, so the profile's permissions are enforced
@@ -261,15 +289,17 @@ export default Plugin.define({
     // and the profile's ordered { action, resource, effect } rules are replayed
     // here with the same last-match-wins precedence OpenCode uses.
 
-    registrations.push(
-      await ctx.permission.hook("evaluate", (event) => {
+    if (domain("permission")) {
+      registrations.push(
+        await domain("permission")!.hook("evaluate", (event) => {
         if (!active?.permissions.length) return
         const effect = resolveEffect(active.permissions, event.action, event.resources)
         if (!effect) return
         event.effect = effect
-        if (effect !== "allow") event.message = `profile '${active.name}': ${event.action} -> ${effect}`
-      }),
-    )
+          if (effect !== "allow") event.message = `profile '${active.name}': ${event.action} -> ${effect}`
+        }),
+      )
+    }
 
     // --- per-agent generation tuning ---------------------------------------
     // V2 has no agent-level temperature/reasoningEffort/textVerbosity fields
@@ -277,29 +307,33 @@ export default Plugin.define({
     // `options`: typed keys are generation settings, any other key is passed to
     // the selected protocol as a provider option.
 
-    registrations.push(
-      await ctx.session.hook("context", (event) => {
-        if (!active) return
-        const agent = active.agents.find((definition) => definition.name === event.agent)
-        if (agent?.temperature !== undefined) event.options.temperature = agent.temperature
-      }),
-    )
+    if (session) {
+      registrations.push(
+        await session.hook("context", (event) => {
+          if (!active) return
+          const agent = active.agents.find((definition) => definition.name === event.agent)
+          if (agent?.temperature !== undefined) event.options.temperature = agent.temperature
+        }),
+      )
+    }
 
     // reasoningEffort / textVerbosity are OpenAI request options, so scope that
     // hook to the provider instead of handing other providers unknown fields.
-    registrations.push(
-      await ctx.session.hook(
-        "context",
-        (event) => {
-          if (!active) return
-          const agent = active.agents.find((definition) => definition.name === event.agent)
-          if (!agent) return
-          if (agent.reasoningEffort) event.options.reasoningEffort = agent.reasoningEffort
-          if (agent.textVerbosity) event.options.textVerbosity = agent.textVerbosity
-        },
-        { providerID: "openai" },
-      ),
-    )
+    if (session) {
+      registrations.push(
+        await session.hook(
+          "context",
+          (event) => {
+            if (!active) return
+            const agent = active.agents.find((definition) => definition.name === event.agent)
+            if (!agent) return
+            if (agent.reasoningEffort) event.options.reasoningEffort = agent.reasoningEffort
+            if (agent.textVerbosity) event.options.textVerbosity = agent.textVerbosity
+          },
+          { providerID: "openai" },
+        ),
+      )
+    }
 
     // --- /profile ----------------------------------------------------------
 
@@ -319,6 +353,8 @@ export default Plugin.define({
       if (w.adapted.length) lines.push(`- V1 but normalized by V2:\n${w.adapted.map((l) => `    - ${l}`).join("\n")}`)
       if (w.legacy.length) lines.push(`- legacy fields (ignored by V2):\n${w.legacy.map((l) => `    - ${l}`).join("\n")}`)
       if (w.unknown.length) lines.push(`- unrecognized fields (ignored): ${w.unknown.join(", ")}`)
+      if (missing.size)
+        lines.push(`- host lacks (stays on base config): ${[...missing].sort().join(", ")}`)
       return lines.join("\n")
     }
 
@@ -331,7 +367,7 @@ export default Plugin.define({
       return rows.length ? `Available:\n${rows.join("\n")}` : `No profiles in ${profilesHint()}`
     }
 
-    const respond = (sessionID: string, text: string) => ctx.session.synthetic({ sessionID, text })
+    const respond = (sessionID: string, text: string) => session?.synthetic({ sessionID, text })
 
     const handle = async (sessionID: string, argument: string) => {
       const name = argument.trim().toLowerCase()
@@ -373,17 +409,19 @@ export default Plugin.define({
       return respond(sessionID, `Active profile: ${target.name}\n\n${report(target)}`)
     }
 
-    registrations.push(
-      await ctx.command.transform((draft) => {
-        draft.add({
-          name: "profile",
-          description: "Switch profile: list, <name>, none, prev",
-          execute: async ({ sessionID, prompt }) => {
-            await handle(sessionID, String(prompt?.text ?? ""))
-          },
-        })
-      }),
-    )
+    if (domain("command")) {
+      registrations.push(
+        await domain("command")!.transform((draft) => {
+          draft.add({
+            name: "profile",
+            description: "Switch profile: list, <name>, none, prev",
+            execute: async ({ sessionID, prompt }) => {
+              await handle(sessionID, String(prompt?.text ?? ""))
+            },
+          })
+        }),
+      )
+    }
 
     // --- selection watcher --------------------------------------------------
     // The TUI half writes the handoff file; this watcher applies it here so the
