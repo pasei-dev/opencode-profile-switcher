@@ -1,10 +1,13 @@
 /**
- * Profile discovery shared by the server and TUI halves.
+ * Profile discovery shared by the server, TUI and desktop halves.
  *
  * A profile is a directory under <config>/profiles/<name>/ containing an
  * opencode.jsonc. Agents are read from <profile>/agents/*.md so they can be
  * created live, since agent definitions are otherwise only discovered at
  * server startup from the launch directory.
+ *
+ * Everything here is pure or filesystem-only. The desktop window never imports
+ * this module; it reads the same data through the server's RPC instead.
  */
 
 import fs from "node:fs"
@@ -12,6 +15,10 @@ import os from "node:os"
 import path from "node:path"
 
 import { Model } from "@opencode/schema"
+
+import type { RestartPolicy, StartupInfo, StartupKind } from "./types.ts"
+
+export type { RestartPolicy, StartupInfo, StartupKind }
 
 // --- paths -----------------------------------------------------------------
 
@@ -27,29 +34,27 @@ export function profilesRoot(): string {
 }
 
 /**
- * Handoff file: the TUI writes the chosen profile here and the server watches
- * it. Keeping this in the watched global config dir means both halves reload
- * without a restart.
+ * Handoff file: the server writes the chosen profile and policy here, and
+ * watches it so a manual edit (or an older client) still applies. The TUI and
+ * the desktop app read it only for the instant first paint; RPC is the source
+ * of truth once the server is reachable.
  */
 export function stateFile(): string {
   return path.join(globalConfigDir(), ".profile-switcher.json")
 }
 
-export function writeSelection(name: string | null, sessionID?: string, startup?: StartupInfo): void {
-  const file = stateFile()
-  fs.mkdirSync(path.dirname(file), { recursive: true })
-  const body: Record<string, unknown> = { profile: name, at: Date.now() }
-  if (sessionID) body.sessionID = sessionID
-  // The server's verdict on startup keys, echoed for the terminal half to read.
-  if (startup) body.startup = startup
-  fs.writeFileSync(file, JSON.stringify(body), "utf8")
-}
-
-export function readSelectionState(): {
+export type SelectionState = {
   profile: string | null
   sessionID?: string
   startup?: StartupInfo
-} {
+  policy?: RestartPolicy
+}
+
+function isPolicy(value: unknown): value is RestartPolicy {
+  return value === "ask" || value === "always" || value === "never"
+}
+
+export function readSelectionState(): SelectionState {
   const parsed = readJsonc(stateFile())
   const startup = parsed?.startup
   return {
@@ -63,11 +68,36 @@ export function readSelectionState(): {
             command: typeof startup.command === "string" ? startup.command : undefined,
           }
         : undefined,
+    policy: isPolicy(parsed?.policy) ? parsed.policy : undefined,
   }
 }
 
 export function readSelection(): string | null {
   return readSelectionState().profile
+}
+
+function writeState(state: SelectionState): void {
+  const file = stateFile()
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  const body: Record<string, unknown> = { profile: state.profile, at: Date.now() }
+  if (state.sessionID) body.sessionID = state.sessionID
+  // The server's verdict on startup keys, echoed for clients to read.
+  if (state.startup) body.startup = state.startup
+  if (state.policy) body.policy = state.policy
+  // Write-then-rename, so the watcher never reads a half-written file.
+  const temp = `${file}.${process.pid}.${Date.now()}.tmp`
+  fs.writeFileSync(temp, JSON.stringify(body), "utf8")
+  fs.renameSync(temp, file)
+}
+
+/** Writes the selection without dropping the stored restart policy. */
+export function writeSelection(name: string | null, sessionID?: string, startup?: StartupInfo): void {
+  writeState({ ...readSelectionState(), profile: name, sessionID, startup })
+}
+
+/** Stores the restart policy shared by every client. */
+export function writePolicy(policy: RestartPolicy): void {
+  writeState({ ...readSelectionState(), policy })
 }
 
 // --- JSONC -----------------------------------------------------------------
@@ -147,6 +177,31 @@ export function parseModelRef(ref: string): Model.Ref | undefined {
   } catch {
     return undefined
   }
+}
+
+/**
+ * V2 accepts both `"provider/model#variant"` and the object form
+ * `{ providerID, model, variant }` for `model` and `agents.<name>.model`.
+ */
+export function modelRefFromConfig(value: unknown): Model.Ref | undefined {
+  if (typeof value === "string") return parseModelRef(value)
+  if (!value || typeof value !== "object") return undefined
+  const { providerID, model, variant } = value as Record<string, unknown>
+  if (typeof providerID !== "string" || providerID === "") return undefined
+  if (typeof model !== "string" || model === "") return undefined
+  const suffix = typeof variant === "string" && variant !== "" ? `#${variant}` : ""
+  return parseModelRef(`${providerID}/${model}${suffix}`)
+}
+
+/** The display form of a config model value, or undefined when it is malformed. */
+export function modelDisplay(value: unknown): string | undefined {
+  if (typeof value === "string") return value !== "" ? value : undefined
+  if (!value || typeof value !== "object") return undefined
+  const { providerID, model, variant } = value as Record<string, unknown>
+  if (typeof providerID !== "string" || providerID === "") return undefined
+  if (typeof model !== "string" || model === "") return undefined
+  const suffix = typeof variant === "string" && variant !== "" ? `#${variant}` : ""
+  return `${providerID}/${model}${suffix}`
 }
 
 // --- agent markdown --------------------------------------------------------
@@ -380,8 +435,8 @@ export function websearchSelection(config: any): string | false | undefined {
 // so nothing is silently applied or silently dropped.
 //
 // Source of truth: the Config contract the server itself serves
-// (`opencode api get /openapi.json` -> Config.InfoEncoded, 28 properties) plus
-// https://opencode.ai/v2/docs/config and /v2/docs/migrate-v1.
+// (`opencode api get /openapi.json` -> Config.Info, 30 properties in 2.2.7)
+// plus https://opencode.ai/v2/docs/config and /v2/docs/migrate-v1.
 
 /** Native V2 top-level keys. */
 const V2_TOP = new Set([
@@ -392,7 +447,9 @@ const V2_TOP = new Set([
   "share",
   "enterprise",
   "username",
+  "timezone",
   "permissions",
+  "policies",
   "agents",
   "snapshots",
   "watcher",
@@ -446,8 +503,23 @@ const LEGACY_TOP: Record<string, string> = {
 }
 
 /** V2 keeps this key but only accepts these members (/v2/docs/config). */
-const V2_EXPERIMENTAL = new Set(["portable_shell_scanner", "subagent_depth", "policies"])
+const V2_EXPERIMENTAL = new Set([
+  "portable_shell_scanner",
+  "all_flags",
+  "part_rows",
+  "image_generate",
+  "subagent_depth",
+  "location_idle_timeout",
+  "artifacts",
+  "background_compaction",
+  "codemode_vm",
+  "console_watches",
+  "media_blob",
+  "schedules",
+  "todo",
+])
 const LEGACY_EXPERIMENTAL: Record<string, string> = {
+  policies: 'deprecated — use top-level "policies"',
   batch_tool: "no V2 equivalent — ignored",
   disable_paste_summary: "no V2 equivalent — ignored",
   continue_loop_on_deny: "no V2 equivalent — ignored",
@@ -545,13 +617,24 @@ export function classifyConfig(config: any): ProfileWarnings {
   // Shape checks on keys that are valid but easy to write in the V1 shape.
   if (config.permissions !== undefined && !Array.isArray(config.permissions))
     warnings.legacy.push("permissions — must be an array of { action, resource, effect }")
+  if (config.policies !== undefined && !Array.isArray(config.policies))
+    warnings.legacy.push("policies — must be an array of { action, resource, effect }")
   if (config.skills !== undefined && !Array.isArray(config.skills))
     warnings.legacy.push('skills — combine "paths" and "urls" into one array')
-  if (config.mcp && typeof config.mcp === "object" && !("servers" in config.mcp) && Object.keys(config.mcp).length)
+  if (config.instructions !== undefined && !Array.isArray(config.instructions))
+    warnings.legacy.push("instructions — must be an array of paths, globs or URLs")
+  if (config.plugins !== undefined && !Array.isArray(config.plugins))
+    warnings.legacy.push('plugins — must be an array of package names or { "package", "options" }')
+  if (
+    config.mcp &&
+    typeof config.mcp === "object" &&
+    !("servers" in config.mcp) &&
+    Object.keys(config.mcp).some((key) => key !== "timeout")
+  )
     warnings.legacy.push('mcp — nest servers under "mcp.servers"')
 
   lintNested(config, warnings, "experimental", V2_EXPERIMENTAL, LEGACY_EXPERIMENTAL)
-  lintNested(config, warnings, "compaction", new Set(["auto", "keep", "buffer"]), LEGACY_COMPACTION)
+  lintNested(config, warnings, "compaction", new Set(["auto", "keep", "buffer", "tokens"]), LEGACY_COMPACTION)
 
   // references / websearch are applied live, so a malformed entry is worth naming.
   for (const [name, value] of Object.entries((config.references ?? {}) as Record<string, any>)) {
@@ -623,15 +706,13 @@ export type Profile = {
  * Keys that need a restart are read once when a server starts. A profile
  * directory is not a launch target (`opencode <dir>` opens a *project*), but the
  * server does read one extra config document from `OPENCODE_CONFIG`, merged
- * above the global and project config — verified against a running 2.0.3 server.
+ * above the global and project config — verified against a running 2.2.7 server.
  * So restarting the service with `OPENCODE_CONFIG=<profile>/opencode.jsonc`
  * applies the whole profile, including `plugins` and `providers`.
  *
- * Only the server knows its own environment, so the server writes this verdict
- * into the handoff file and the terminal reads it back.
+ * Only the server knows its own environment, so it reports this verdict over
+ * RPC (and echoes it into the handoff file for older clients).
  */
-export type StartupKind = "none" | "pending" | "layered"
-export type StartupInfo = { kind: StartupKind; keys: string[]; command?: string }
 
 /** The command a manual restart needs, layered or un-layered. */
 export function restartCommand(configFile: string | null): string {
@@ -645,6 +726,19 @@ export function startupInfo(configFile: string, relaunch: string[], env?: string
   if (env !== undefined && env !== "" && path.resolve(env) === path.resolve(configFile))
     return { kind: "layered", keys: relaunch }
   return { kind: "pending", keys: relaunch, command: restartCommand(configFile) }
+}
+
+/**
+ * The profile whose config file the server was started with, if any. Unlike
+ * `startupInfo`, this answers even for a profile with no startup-only keys.
+ */
+export function layeredProfileName(
+  profiles: ReadonlyArray<{ name: string; configFile: string }>,
+  env?: string,
+): string | null {
+  if (!env || env.trim() === "") return null
+  const target = path.resolve(env)
+  return profiles.find((profile) => path.resolve(profile.configFile) === target)?.name ?? null
 }
 
 /**
@@ -670,8 +764,6 @@ export function staleAgentNames(
 }
 
 // --- restart policy --------------------------------------------------------
-
-export type RestartPolicy = "ask" | "always" | "never"
 
 /** Reads the durable preference, including the pre-1.4 boolean `askRestart`. */
 export function normalizeRestartPolicy(stored: Record<string, unknown> | undefined): RestartPolicy {
@@ -759,7 +851,8 @@ export function readBaseConfig(): any | undefined {
 function summarize(config: any): string {
   const bits: string[] = []
   if (config.default_agent) bits.push(`agent ${config.default_agent}`)
-  if (config.model) bits.push(`model ${config.model}`)
+  const model = modelDisplay(config.model)
+  if (model) bits.push(`model ${model}`)
   return bits.join(" · ") || "config overlay"
 }
 
@@ -801,10 +894,10 @@ export function loadProfiles(options: { includeHidden?: boolean } = {}): Profile
         .filter(([, agent]) => agent?.disabled === true)
         .map(([name]) => name),
       agentModels: Object.entries(agents)
-        .filter(([, agent]) => typeof agent?.model === "string")
-        .map(([name, agent]) => ({ agent: name, model: String(agent.model) })),
+        .map(([name, agent]) => ({ agent: name, model: modelDisplay(agent?.model) }))
+        .filter((entry): entry is { agent: string; model: string } => entry.model !== undefined),
       defaultAgent: typeof config.default_agent === "string" ? config.default_agent : undefined,
-      defaultModel: typeof config.model === "string" ? config.model : undefined,
+      defaultModel: modelDisplay(config.model),
       permissions: toPermissionRules(config.permissions),
       mcpCount: Object.keys(mcpServers(config)).length,
       pluginCount: Array.isArray(config.plugins) ? config.plugins.length : 0,

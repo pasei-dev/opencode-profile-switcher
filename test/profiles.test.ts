@@ -1,15 +1,23 @@
 import { describe, expect, test } from "bun:test"
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
 
 import {
   POLICY_VERSION,
   agentMode,
   classifyConfig,
   cliBinary,
+  layeredProfileName,
+  loadProfiles,
   mcpServers,
+  modelDisplay,
+  modelRefFromConfig,
   nextRestartPolicy,
   normalizeRestartPolicy,
   parseAgentMarkdown,
   parseModelRef,
+  readSelectionState,
   referenceSources,
   restartCommand,
   restartEnv,
@@ -20,6 +28,8 @@ import {
   startupLabel,
   toPermissionRules,
   websearchSelection,
+  writePolicy,
+  writeSelection,
 } from "../src/profiles.ts"
 
 describe("parseModelRef", () => {
@@ -40,6 +50,33 @@ describe("parseModelRef", () => {
     expect(parseModelRef("/gpt-5.4")).toBeUndefined()
     expect(parseModelRef("openai/")).toBeUndefined()
     expect(parseModelRef("")).toBeUndefined()
+  })
+})
+
+describe("modelRefFromConfig", () => {
+  test("reads both the string and the object form", () => {
+    expect(String(modelRefFromConfig("anthropic/claude#high")?.id)).toBe("claude")
+    const object = modelRefFromConfig({ providerID: "openai", model: "gpt-5.4", variant: "low" })
+    expect(String(object?.providerID)).toBe("openai")
+    expect(String(object?.id)).toBe("gpt-5.4")
+    expect(String(object?.variant)).toBe("low")
+    expect(modelRefFromConfig({ providerID: "openai", model: "gpt-5.4" })?.variant).toBeUndefined()
+  })
+
+  test("rejects malformed values instead of throwing", () => {
+    expect(modelRefFromConfig(undefined)).toBeUndefined()
+    expect(modelRefFromConfig({})).toBeUndefined()
+    expect(modelRefFromConfig({ providerID: "", model: "x" })).toBeUndefined()
+    expect(modelRefFromConfig({ providerID: "x", model: "" })).toBeUndefined()
+    expect(modelRefFromConfig("nope")).toBeUndefined()
+  })
+
+  test("modelDisplay renders the canonical string", () => {
+    expect(modelDisplay("anthropic/claude#high")).toBe("anthropic/claude#high")
+    expect(modelDisplay({ providerID: "openai", model: "gpt-5.4", variant: "low" })).toBe("openai/gpt-5.4#low")
+    expect(modelDisplay({ providerID: "openai", model: "gpt-5.4" })).toBe("openai/gpt-5.4")
+    expect(modelDisplay("")).toBeUndefined()
+    expect(modelDisplay({})).toBeUndefined()
   })
 })
 
@@ -203,6 +240,12 @@ describe("classifyConfig", () => {
     expect(w.legacy).toEqual(expect.arrayContaining([expect.stringContaining("skills — combine")]))
   })
 
+  test("mcp.timeout alone is native, not a V1 container", () => {
+    const w = classifyConfig({ mcp: { timeout: { execution: 30_000 } } })
+    expect(w.legacy).toEqual([])
+    expect(w.unknown).toEqual([])
+  })
+
   test("names malformed references and websearch entries", () => {
     const w = classifyConfig({
       references: { good: { path: "/x" }, bad: { description: "no source" } },
@@ -216,6 +259,36 @@ describe("classifyConfig", () => {
   test("an empty config produces no warnings", () => {
     expect(classifyConfig({})).toEqual({ applied: [], relaunch: [], adapted: [], legacy: [], unknown: [] })
     expect(classifyConfig(undefined).applied).toEqual([])
+  })
+
+  test("2.2.7 top-level keys are native, not unknown", () => {
+    const w = classifyConfig({
+      timezone: "Europe/Copenhagen",
+      policies: [{ action: "provider.use", resource: "*", effect: "deny" }],
+      skills: ["./team-skills"],
+      instructions: ["AGENTS.md"],
+      plugins: ["opencode-example"],
+    })
+    expect(w.relaunch.sort()).toEqual(["instructions", "plugins", "policies", "skills", "timezone"])
+    expect(w.unknown).toEqual([])
+    expect(w.legacy).toEqual([])
+  })
+
+  test("experimental.policies is reported as deprecated, not unknown", () => {
+    const w = classifyConfig({ experimental: { policies: [], todo: true } })
+    expect(w.legacy).toEqual(expect.arrayContaining([expect.stringContaining("experimental.policies")]))
+    expect(w.unknown).toEqual([])
+  })
+
+  test("flags V1-shaped policies, instructions and plugins containers", () => {
+    const w = classifyConfig({
+      policies: { deny: true },
+      instructions: "AGENTS.md",
+      plugins: { package: "x" },
+    })
+    expect(w.legacy).toEqual(expect.arrayContaining([expect.stringContaining("policies — must be an array")]))
+    expect(w.legacy).toEqual(expect.arrayContaining([expect.stringContaining("instructions — must be an array")]))
+    expect(w.legacy).toEqual(expect.arrayContaining([expect.stringContaining("plugins — must be an array")]))
   })
 })
 
@@ -342,6 +415,81 @@ describe("startupInfo", () => {
     expect(startupLabel(startupInfo(config, ["plugins", "lsp"]))).toBe("⟳ needs restart (2)")
     expect(startupLabel(startupInfo(config, ["plugins"], config))).toBe("✓ startup loaded")
     expect(startupLabel(startupInfo(config, []))).toBe("")
+  })
+
+  test("layeredProfileName answers even when the profile has no startup keys", () => {
+    const profiles = [
+      { name: "deep", configFile: "/p/deep/opencode.jsonc" },
+      { name: "fast", configFile: "/p/fast/opencode.jsonc" },
+    ]
+    expect(layeredProfileName(profiles, "/p/deep/opencode.jsonc")).toBe("deep")
+    expect(layeredProfileName(profiles, "/p/deep/../deep/opencode.jsonc")).toBe("deep")
+    expect(layeredProfileName(profiles, "/p/other/opencode.jsonc")).toBeNull()
+    expect(layeredProfileName(profiles, undefined)).toBeNull()
+    expect(layeredProfileName(profiles, "")).toBeNull()
+  })
+})
+
+describe("shared selection state", () => {
+  const withConfig = (fn: (dir: string) => void) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "profile-switcher-"))
+    const previous = process.env.XDG_CONFIG_HOME
+    process.env.XDG_CONFIG_HOME = dir
+    try {
+      fn(dir)
+    } finally {
+      if (previous === undefined) delete process.env.XDG_CONFIG_HOME
+      else process.env.XDG_CONFIG_HOME = previous
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  test("writeSelection preserves the policy and writePolicy preserves the profile", () => {
+    withConfig(() => {
+      writePolicy("never")
+      writeSelection("deep", "session-1", { kind: "pending", keys: ["plugins"], command: "restart" })
+
+      const state = readSelectionState()
+      expect(state.profile).toBe("deep")
+      expect(state.sessionID).toBe("session-1")
+      expect(state.policy).toBe("never")
+      expect(state.startup).toEqual({ kind: "pending", keys: ["plugins"], command: "restart" })
+
+      writePolicy("ask")
+      const after = readSelectionState()
+      expect(after.profile).toBe("deep")
+      expect(after.sessionID).toBe("session-1")
+      expect(after.policy).toBe("ask")
+    })
+  })
+
+  test("switching to base keeps the policy", () => {
+    withConfig(() => {
+      writePolicy("always")
+      writeSelection(null)
+      const state = readSelectionState()
+      expect(state.profile).toBeNull()
+      expect(state.policy).toBe("always")
+    })
+  })
+
+  test("loadProfiles reads the object model form", () => {
+    withConfig((dir) => {
+      const profileDir = path.join(dir, "opencode", "profiles", "deep")
+      fs.mkdirSync(profileDir, { recursive: true })
+      fs.writeFileSync(
+        path.join(profileDir, "opencode.jsonc"),
+        JSON.stringify({
+          model: { providerID: "anthropic", model: "claude", variant: "high" },
+          agents: { reviewer: { model: { providerID: "openai", model: "gpt-5.4", variant: "low" } } },
+        }),
+      )
+
+      const profiles = loadProfiles()
+      expect(profiles).toHaveLength(1)
+      expect(profiles[0].defaultModel).toBe("anthropic/claude#high")
+      expect(profiles[0].agentModels).toEqual([{ agent: "reviewer", model: "openai/gpt-5.4#low" }])
+    })
   })
 })
 
