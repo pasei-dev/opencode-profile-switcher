@@ -92,6 +92,8 @@ export default Plugin.define({
     const running = new Set<string>()
     /** Set once the RPC is registered; apply() and the watcher emit through it. */
     let emitChanged: (() => void) | undefined
+    /** Asks a connected TUI to open its profile picker. */
+    let emitPick: (() => void) | undefined
 
     const refresh = async () => {
       profiles = loadProfiles()
@@ -463,6 +465,11 @@ export default Plugin.define({
           // No subscribers or the server is shutting down; nothing to report.
         })
     }
+    emitPick = () => {
+      void rpc.events.emit("pick", {}).catch(() => {
+        // No TUI attached; the command's text answer still says what happened.
+      })
+    }
 
     // --- /profile ----------------------------------------------------------
 
@@ -500,7 +507,14 @@ export default Plugin.define({
     const handle = async (sessionID: string, argument: string) => {
       const name = argument.trim().toLowerCase()
 
-      if (name === "" || name === "list" || name === "status") {
+      // Bare `/profile` is the picker: the TUI opens its popup on the event, and
+      // the text answer is the fallback for a client that has none.
+      if (name === "") {
+        emitPick?.()
+        return respond(sessionID, "Opening the profile picker — or run `/profile list` for the text form.")
+      }
+
+      if (name === "list" || name === "status") {
         if (!active) return respond(sessionID, `No profile applied — base config only.\n\n${listing()}`)
         return respond(sessionID, `Active profile: ${active.name}\n\n${report(active)}\n\n${listing()}`)
       }
@@ -551,7 +565,7 @@ export default Plugin.define({
       await ctx.command.transform((draft) => {
         draft.add({
           name: "profile",
-          description: "Switch profile: list, <name>, none, prev, policy, restart",
+          description: "Open the profile picker (or: list, <name>, none, prev, policy, restart)",
           execute: async ({ sessionID, prompt }) => {
             await handle(sessionID, String(prompt?.text ?? ""))
           },

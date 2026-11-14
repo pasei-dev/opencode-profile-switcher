@@ -576,6 +576,10 @@ export default Plugin.define({
       later(reflect, 300)
     })
 
+    // Bare `/profile` runs on the server, which cannot open a popup itself; it
+    // asks the TUI to do it.
+    const offPick = rpc().events.on("pick", () => void openPicker())
+
     // A missed event (server restart, a reconnect) must not leave the badge
     // stale forever.
     const poll = setInterval(() => void refresh(), 20_000)
@@ -598,6 +602,7 @@ export default Plugin.define({
       for (const timer of deferred) clearTimeout(timer)
       deferred.clear()
       offChanged()
+      offPick()
       for (const off of unsubscribe) off()
       removeSlot()
     }

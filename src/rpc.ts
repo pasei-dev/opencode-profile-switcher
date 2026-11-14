@@ -146,6 +146,10 @@ export const Profiles = Rpc.define({
         additionalProperties: false,
       },
     },
+    /** A client should open its profile picker (bare `/profile`). */
+    pick: {
+      schema: { type: "object", additionalProperties: false },
+    },
   },
 })
 
