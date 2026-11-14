@@ -21,7 +21,7 @@ import { spawn } from "node:child_process"
 
 import { Plugin } from "@opencode/plugin/tui"
 
-import { Profiles, asSnapshot } from "./rpc.ts"
+import { Profiles, asClaim, asSnapshot } from "./rpc.ts"
 import type { ProfileView, RestartPolicy, Snapshot } from "./types.ts"
 import {
   POLICY_VERSION,
@@ -49,6 +49,7 @@ export default Plugin.define({
       initial: {
         active: readSelection(),
         layered: null,
+        expected: null,
         policy: "always",
         policyStored: false,
         profilesRoot: "",
@@ -111,7 +112,7 @@ export default Plugin.define({
     let migrated = false
     const refresh = async () => {
       try {
-        const snap = asSnapshot(await rpc().list({}))
+        let snap = asSnapshot(await rpc().list({}))
         applySnapshot(snap)
 
         // A pre-2.0 TUI stored the policy locally. Import an explicit choice
@@ -129,12 +130,26 @@ export default Plugin.define({
               askRestart: prefs.askRestart,
               restartPolicy: prefs.restartPolicy,
             })
-            applySnapshot(asSnapshot(await rpc().setPolicy({ policy })))
+            snap = asSnapshot(await rpc().setPolicy({ policy }))
+            applySnapshot(snap)
           }
         }
+
+        // After the policy is settled, so a migrated `never` is honoured.
+        await maybeRelayer(snap)
       } catch (error) {
         console.warn("[profile-switcher] could not read profiles from the server", error)
       }
+    }
+
+    /** Deferred cache refreshes after a switch; cleared on unload. */
+    const deferred = new Set<ReturnType<typeof setTimeout>>()
+    const later = (fn: () => void, ms: number) => {
+      const timer = setTimeout(() => {
+        deferred.delete(timer)
+        fn()
+      }, ms)
+      deferred.add(timer)
     }
 
     // Latest session seen by the footer slot (slot input carries sessionID).
@@ -228,12 +243,21 @@ export default Plugin.define({
         draft.file = null
       })
 
-    const flushQueue = () => {
+    const flushQueue = async () => {
       if (!queue.pending || busy()) return
       const { profile, file } = queue
       clearQueue()
       // The queued file is authoritative: a profile deleted between switch and
-      // idle still has to be layered in, or un-layered if it is gone.
+      // idle still has to be layered in, or un-layered if it is gone. But a
+      // switch made in the meantime wins — restarting with the profile the user
+      // already left would layer the wrong config.
+      try {
+        if (asSnapshot(await rpc().list({})).active !== profile) return
+      } catch {
+        // The server may be unreachable while it restarts; the next refresh
+        // shows the marker, and the user can restart from the picker.
+        return
+      }
       doRestart(profile, file)
     }
 
@@ -255,6 +279,31 @@ export default Plugin.define({
         variant: "info",
         duration: 5000,
       })
+    }
+
+    /**
+     * Put the layer back if the service lost it. The desktop app starts its own
+     * background server with its own environment, which drops OPENCODE_CONFIG;
+     * under the default `always` policy the marker should not be a dead end.
+     *
+     * The decision uses the server's handoff record, never this client's
+     * memory: another client may have switched since, and racing its restart
+     * would bounce the service twice. The server also hands out a single claim
+     * at a time, so two windows cannot both restart.
+     */
+    async function maybeRelayer(snap: Snapshot) {
+      if (snap.layered !== null) return
+      if (!snap.active || snap.expected !== snap.active) return
+      if (snap.policy !== "always" || snap.busy) return
+      const target = snap.profiles.find((profile) => profile.name === snap.active)
+      if (!target || target.restart !== "pending") return
+      try {
+        if (!asClaim(await rpc().claimRestart({ profile: snap.active })).allowed) return
+      } catch (error) {
+        console.warn("[profile-switcher] could not claim the layer restart", error)
+        return
+      }
+      requestRestart(target)
     }
 
     /**
@@ -345,8 +394,8 @@ export default Plugin.define({
         applySnapshot(snap)
         // Give the server a beat to apply, then refresh the TUI's per-location
         // caches so the switch is visible without a relaunch.
-        setTimeout(reflect, 300)
-        setTimeout(reflect, 1500)
+        later(reflect, 300)
+        later(reflect, 1500)
         // The server moves this session onto the profile's default agent; re-sync
         // it so the composer/agent badge updates without a relaunch.
         if (sessionID) {
@@ -358,8 +407,8 @@ export default Plugin.define({
               console.warn("[profile-switcher] could not refresh session", error)
             }
           }
-          setTimeout(resync, 600)
-          setTimeout(resync, 2000)
+          later(resync, 600)
+          later(resync, 2000)
         }
         notify(name, snap)
         void offerRestart(snap, name)
@@ -524,7 +573,7 @@ export default Plugin.define({
     // refresh the location caches so server-side switches are visible too.
     const offChanged = rpc().events.on("changed", () => {
       void refresh()
-      setTimeout(reflect, 300)
+      later(reflect, 300)
     })
 
     // A missed event (server restart, a reconnect) must not leave the badge
@@ -542,10 +591,12 @@ export default Plugin.define({
         "session.execution.failed",
         "session.execution.interrupted",
       ] as const
-    ).map((type) => context.data.on(type, () => flushQueue()))
+    ).map((type) => context.data.on(type, () => void flushQueue()))
 
     return () => {
       clearInterval(poll)
+      for (const timer of deferred) clearTimeout(timer)
+      deferred.clear()
       offChanged()
       for (const off of unsubscribe) off()
       removeSlot()

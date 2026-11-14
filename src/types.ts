@@ -42,6 +42,12 @@ export type Snapshot = {
   active: string | null
   /** The profile whose config file the server was started with, if any. */
   layered: string | null
+  /**
+   * The profile the handoff record says should be layered. Differs from
+   * `layered` when a host restarted the service without the layer; clients
+   * restore it under the `always` policy.
+   */
+  expected: string | null
   policy: RestartPolicy
   /** False while the policy is still the implicit default (used to migrate old TUI prefs). */
   policyStored: boolean
@@ -58,3 +64,6 @@ export type ChangedEvent = {
 }
 
 export type BusyResult = { busy: boolean }
+
+/** The server's answer to "may this client restore the layer now?". */
+export type ClaimResult = { allowed: boolean }

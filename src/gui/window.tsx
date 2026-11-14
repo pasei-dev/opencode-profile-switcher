@@ -16,7 +16,7 @@ import {
 } from "@opencode/plugin/gui"
 import { For, Show, createSignal } from "solid-js"
 
-import { Profiles, asBusy, asSnapshot } from "../rpc.ts"
+import { Profiles, asBusy, asClaim, asSnapshot } from "../rpc.ts"
 import type { ProfileView, RestartPolicy, Snapshot } from "../types.ts"
 import { Restart } from "./contract.ts"
 
@@ -25,6 +25,13 @@ export const setup: Plugin.Setup = (ctx) => {
   const [error, setError] = createSignal<string | undefined>()
   const timers = new Set<number>()
   let sequence = 0
+  /**
+   * At most one restart may be queued. Switching again while a turn is running
+   * must replace the pending restart, not stack a second timer that would bounce
+   * the server with the profile the user already left.
+   */
+  let queued: { timer: number; toast: { dismiss(): void } } | undefined
+  let restartGeneration = 0
 
   const rpc = () => ctx.client.rpc(Profiles)
 
@@ -35,10 +42,38 @@ export const setup: Plugin.Setup = (ctx) => {
       if (mine !== sequence || ctx.signal.aborted) return
       setSnapshot(snap)
       setError(undefined)
+      // Not awaited: a restart must not hold up the next refresh, and the
+      // server's claim is what serialises clients anyway.
+      void maybeRelayer(snap)
     } catch (cause) {
       if (mine !== sequence || ctx.signal.aborted) return
       setError(cause instanceof Error ? cause.message : String(cause))
     }
+  }
+
+  /**
+   * Restore the layer after the app's own server start dropped it. The default
+   * `always` policy says a switch applies the whole profile, so the marker
+   * should not be a dead end.
+   *
+   * The decision uses the server's handoff record, never this window's memory:
+   * another client may have switched since, and racing its restart would bounce
+   * the service twice. The server also hands out a single claim at a time, so
+   * two windows cannot both restart.
+   */
+  async function maybeRelayer(snap: Snapshot) {
+    if (snap.layered !== null) return
+    if (!snap.active || snap.expected !== snap.active) return
+    if (snap.policy !== "always" || snap.busy) return
+    const profile = snap.profiles.find((entry) => entry.name === snap.active)
+    if (!profile || profile.restart !== "pending") return
+    try {
+      if (!asClaim(await rpc().claimRestart({ profile: snap.active })).allowed) return
+    } catch {
+      // The server may be restarting already; the next refresh will retry.
+      return
+    }
+    await restartWhenIdle(snap, snap.active)
   }
 
   const describe = (profile: ProfileView) => {
@@ -94,7 +129,32 @@ export const setup: Plugin.Setup = (ctx) => {
     }
   }
 
+  const cancelQueued = () => {
+    if (!queued) return
+    window.clearInterval(queued.timer)
+    timers.delete(queued.timer)
+    queued.toast.dismiss()
+    queued = undefined
+  }
+
+  /**
+   * True when the active profile still matches, i.e. this restart is not stale.
+   * A switch made while a restart was waiting for an idle turn wins: restarting
+   * with the profile the user already left would layer the wrong config.
+   */
+  const stillWanted = async (name: string | null) => {
+    try {
+      return asSnapshot(await rpc().list({})).active === name
+    } catch {
+      // The server may be unreachable while it restarts; the next refresh shows
+      // the marker, and the user can restart from the picker.
+      return false
+    }
+  }
+
   const restartWhenIdle = async (snap: Snapshot, name: string | null) => {
+    const generation = ++restartGeneration
+    cancelQueued()
     const profile = name ? snap.profiles.find((entry) => entry.name === name) : undefined
     const file = profile?.configFile ?? null
 
@@ -108,9 +168,11 @@ export const setup: Plugin.Setup = (ctx) => {
     }
 
     if (!(await busy())) {
-      await doRestart(name, file)
+      // A newer switch superseded this one while the call was in flight.
+      if (generation === restartGeneration && (await stillWanted(name))) await doRestart(name, file)
       return
     }
+    if (generation !== restartGeneration) return
 
     const toast = ctx.toast.show({
       title: ctx.t("toast.restartTitle"),
@@ -119,13 +181,22 @@ export const setup: Plugin.Setup = (ctx) => {
       persistent: true,
     })
     const timer = window.setInterval(async () => {
+      if (generation !== restartGeneration) {
+        window.clearInterval(timer)
+        timers.delete(timer)
+        return
+      }
       if (await busy()) return
-      window.clearInterval(timer)
-      timers.delete(timer)
-      toast.dismiss()
+      if (generation !== restartGeneration) return
+      if (!(await stillWanted(name))) {
+        cancelQueued()
+        return
+      }
+      cancelQueued()
       await doRestart(name, file)
     }, 2000)
     timers.add(timer)
+    queued = { timer, toast }
   }
 
   const maybeRestart = async (snap: Snapshot, name: string | null) => {
@@ -255,9 +326,10 @@ export const setup: Plugin.Setup = (ctx) => {
       if (!snap) return undefined
       const active = snap.profiles.find((profile) => profile.name === snap.active)
       const pending = active?.restart === "pending" || (!snap.active && snap.layered !== null)
+      const label = snap.active ?? ctx.t("base")
       return {
         id: "profile",
-        label: snap.active ?? ctx.t("base"),
+        label: pending ? `⟳ ${label}` : label,
         title: active ? active.label : ctx.t("base.description"),
         icon: pending ? "warning" : "status",
         run: () => void pick(),
@@ -415,5 +487,7 @@ export const setup: Plugin.Setup = (ctx) => {
       window.clearInterval(timer)
     }
     timers.clear()
+    queued?.toast.dismiss()
+    queued = undefined
   }
 }

@@ -14,7 +14,7 @@
  * the RPC in ./rpc.ts, so there is one implementation of discovery, linting and
  * application.
  *
- * Source of truth: https://opencode.ai/v2/docs/build/plugins/server (2.2.7)
+ * Source of truth: https://opencode.ai/v2/docs/build/plugins/server (2.3.0)
  */
 
 import fs from "node:fs"
@@ -27,6 +27,8 @@ import { Profiles, asPolicy } from "./rpc.ts"
 import type { ProfileView, Snapshot } from "./types.ts"
 import {
   agentMode,
+  claimRelayer,
+  expectedLayered,
   globalConfigDir,
   layeredProfileName,
   loadProfiles,
@@ -78,6 +80,12 @@ export default Plugin.define({
     let active: Profile | undefined
     let profiles: Profile[] = []
     let previous: string | null = null
+    /**
+     * Lookups rebuilt whenever the active profile changes. The context hook runs
+     * on every request, so it must not scan the profile's arrays each time.
+     */
+    let agentByName = new Map<string, Profile["agents"][number]>()
+    let agentModelByName = new Map<string, string>()
     /** Every registration, disposed on unload so hot-reloads do not stack. */
     const registrations: Array<{ dispose(): Promise<void> | void }> = []
     /** Sessions with a running turn, tracked from `session.status` events. */
@@ -91,6 +99,8 @@ export default Plugin.define({
 
     const select = (name: string | null) => {
       active = name ? profiles.find((profile) => profile.name === name) : undefined
+      agentByName = new Map((active?.agents ?? []).map((definition) => [definition.name, definition]))
+      agentModelByName = new Map((active?.agentModels ?? []).map((entry) => [entry.agent, entry.model]))
     }
 
     const policy = () => readSelectionState().policy ?? "always"
@@ -113,8 +123,8 @@ export default Plugin.define({
       if (!active) return undefined
       const agentName = active.defaultAgent
       if (agentName) {
-        const override = active.agentModels.find((entry) => entry.agent === agentName)?.model
-        const definition = active.agents.find((definition) => definition.name === agentName)?.model
+        const override = agentModelByName.get(agentName)
+        const definition = agentByName.get(agentName)?.model
         const agentRef = parseModelRef(override ?? "") ?? parseModelRef(definition ?? "")
         if (agentRef) return agentRef
       }
@@ -201,7 +211,7 @@ export default Plugin.define({
       configFile: profile.configFile,
       ...(profile.defaultAgent ? { defaultAgent: profile.defaultAgent } : {}),
       ...(profile.defaultModel ? { defaultModel: profile.defaultModel } : {}),
-      agents: profile.agents.map((definition) => definition.name),
+      agents: profile.agents.filter((definition) => !definition.disabled).map((definition) => definition.name),
       applied: profile.warnings.applied,
       relaunch: profile.warnings.relaunch,
       adapted: profile.warnings.adapted,
@@ -217,6 +227,7 @@ export default Plugin.define({
       return {
         active: active?.name ?? null,
         layered: layeredProfileName(profiles, process.env.OPENCODE_CONFIG),
+        expected: expectedLayered(state),
         policy: state.policy ?? "always",
         policyStored: state.policy !== undefined,
         profilesRoot: profilesRoot(),
@@ -228,6 +239,19 @@ export default Plugin.define({
     await refresh()
     select(readSelection())
 
+    // `apply` writes the handoff before the restart, so it records the
+    // pre-restart verdict ("pending"). Once the layered server is up, correct
+    // the record: clients read it for their first paint, and a stale "pending"
+    // is what makes the marker survive a successful restart.
+    const bootLayered = layeredProfileName(profiles, process.env.OPENCODE_CONFIG)
+    if (active && bootLayered === active.name) {
+      const stored = readSelectionState()
+      const startup = startupInfo(active.configFile, active.warnings.relaunch, process.env.OPENCODE_CONFIG)
+      if (stored.profile !== active.name || stored.startup?.kind !== startup.kind) {
+        writeSelection(active.name, stored.sessionID, startup)
+      }
+    }
+
     // --- agents ------------------------------------------------------------
 
     registrations.push(
@@ -237,42 +261,47 @@ export default Plugin.define({
         // configured. That is what makes `/profile none` restore `build` — the
         // `created` bookkeeping this replaces *hid* those agents instead, and
         // nothing ever un-hid them, so reverting could not switch back to them.
-        const fromFiles = new Set<string>()
-
         if (active) {
+          // `active.agents` is the merge of both native sources: `agents` keys
+          // in opencode.jsonc and markdown files under agent/agents/mode/modes.
+          // A config-only agent is created here, exactly as core does, so a
+          // profile does not need an agents/ directory to be usable live.
           for (const definition of active.agents) {
-            fromFiles.add(definition.name)
-            draft.update(definition.name, (agent) => {
-              agent.name = Agent.Name.make(definition.name)
-              agent.hidden = false
-              if (definition.description) agent.description = definition.description
+            const name = definition.name
+
+            // Hide disabled agents instead of removing them: a session already
+            // bound to one would otherwise die with Session.AgentNotFoundError
+            // on its next turn. Hidden agents stay resolvable but drop out of
+            // the picker (core: selectable = mode !== "subagent" && !hidden).
+            if (definition.disabled) {
+              if (draft.get(name)) draft.update(name, (agent) => { agent.hidden = true })
+              continue
+            }
+
+            // A config entry that only retunes an agent (a model, a colour) is
+            // not a definition: creating it would add a prompt-less primary
+            // agent with core's default `*: allow` rules to the picker. So it
+            // may only update an agent that already exists.
+            const defines =
+              definition.system !== undefined ||
+              agentMode(definition.mode) !== undefined ||
+              definition.description !== undefined
+            if (!defines && !draft.get(name)) continue
+
+            draft.update(name, (agent) => {
+              agent.name = Agent.Name.make(name)
+              if (definition.description !== undefined) agent.description = definition.description
               const mode = agentMode(definition.mode)
               if (mode) agent.mode = mode
-              if (definition.system) agent.system = definition.system
+              if (definition.system !== undefined) agent.system = definition.system
               const ref = parseModelRef(definition.model ?? "")
               if (ref) agent.model = ref
-            })
-          }
-
-          for (const { agent: name, model } of active.agentModels) {
-            // Config model overrides target agents that already exist, or that
-            // this profile ships a definition for. Never invent a nameless stub.
-            const ref = parseModelRef(model)
-            if (!ref) continue
-            if (!draft.get(name) && !fromFiles.has(name)) continue
-            draft.update(name, (agent) => {
-              agent.model = ref
-            })
-          }
-
-          // Hide disabled agents instead of removing them: a session already
-          // bound to one would otherwise die with Session.AgentNotFoundError on
-          // its next turn. Hidden agents stay resolvable but drop out of the
-          // picker (opencode core: selectable = mode !== "subagent" && !hidden).
-          for (const name of active.disabledAgents) {
-            if (!draft.get(name)) continue
-            draft.update(name, (agent) => {
-              agent.hidden = true
+              if (definition.hidden !== undefined) agent.hidden = definition.hidden
+              if (definition.color !== undefined) agent.color = definition.color
+              if (definition.steps !== undefined) agent.steps = definition.steps
+              if (definition.permissions?.length) agent.permissions.push(...definition.permissions)
+              if (definition.request?.headers) Object.assign(agent.request.headers, definition.request.headers)
+              if (definition.request?.body) Object.assign(agent.request.body, definition.request.body)
             })
           }
 
@@ -354,7 +383,7 @@ export default Plugin.define({
     registrations.push(
       await ctx.session.hook("context", (event) => {
         if (!active) return
-        const agent = active.agents.find((definition) => definition.name === event.agent)
+        const agent = agentByName.get(event.agent)
         if (agent?.temperature !== undefined) event.options.temperature = agent.temperature
       }),
     )
@@ -366,7 +395,7 @@ export default Plugin.define({
         "context",
         (event) => {
           if (!active) return
-          const agent = active.agents.find((definition) => definition.name === event.agent)
+          const agent = agentByName.get(event.agent)
           if (!agent) return
           if (agent.reasoningEffort) event.options.reasoningEffort = agent.reasoningEffort
           if (agent.textVerbosity) event.options.textVerbosity = agent.textVerbosity
@@ -415,6 +444,16 @@ export default Plugin.define({
         return snapshot()
       },
       busy: async () => ({ busy: running.size > 0 }),
+      // One client at a time may restore a dropped layer, and only a few times:
+      // the token lives in the shared handoff file, not in each client. The
+      // server enforces the same invariant the clients check, so a stray call
+      // cannot spend an attempt while the layer is live.
+      claimRestart: async (input) => {
+        const { profile } = input as { profile: string }
+        const live = layeredProfileName(profiles, process.env.OPENCODE_CONFIG)
+        const allowed = live === null && profile === (active?.name ?? null) && claimRelayer(profile)
+        return { allowed }
+      },
     })
     registrations.push(rpc)
     emitChanged = () => {
@@ -432,7 +471,8 @@ export default Plugin.define({
       const lines = [`**${profile.label}** — \`${profile.directory}\``]
       if (profile.defaultAgent) lines.push(`- default agent: \`${profile.defaultAgent}\``)
       if (profile.defaultModel) lines.push(`- default model: \`${profile.defaultModel}\``)
-      if (profile.agents.length) lines.push(`- agents: ${profile.agents.map((a) => a.name).join(", ")}`)
+      const agentNames = profile.agents.filter((agent) => !agent.disabled).map((agent) => agent.name)
+      if (agentNames.length) lines.push(`- agents: ${agentNames.join(", ")}`)
       if (w.applied.length) lines.push(`- applied live: ${w.applied.join(", ")}`)
       const startup = startupInfo(profile.configFile, w.relaunch, process.env.OPENCODE_CONFIG)
       if (startup.kind === "layered") lines.push(`- startup keys loaded: ${startup.keys.join(", ")}`)

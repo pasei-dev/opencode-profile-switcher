@@ -5,18 +5,28 @@ import path from "node:path"
 
 import {
   POLICY_VERSION,
+  RELAYER_ATTEMPTS,
+  RELAYER_COOLDOWN_MS,
+  RELAYER_RESET_MS,
   agentMode,
+  canonicalConfigPath,
   classifyConfig,
   cliBinary,
+  configAgents,
+  claimRelayer,
+  expectedLayered,
   layeredProfileName,
   loadProfiles,
   mcpServers,
+  mergeAgent,
   modelDisplay,
   modelRefFromConfig,
   nextRestartPolicy,
   normalizeRestartPolicy,
   parseAgentMarkdown,
   parseModelRef,
+  readAgents,
+  readConfigJsonc,
   readSelectionState,
   referenceSources,
   restartCommand,
@@ -26,6 +36,7 @@ import {
   staleAgentNames,
   startupInfo,
   startupLabel,
+  substituteConfigText,
   toPermissionRules,
   websearchSelection,
   writePolicy,
@@ -261,7 +272,7 @@ describe("classifyConfig", () => {
     expect(classifyConfig(undefined).applied).toEqual([])
   })
 
-  test("2.2.7 top-level keys are native, not unknown", () => {
+  test("2.3.0 top-level keys are native, not unknown", () => {
     const w = classifyConfig({
       timezone: "Europe/Copenhagen",
       policies: [{ action: "provider.use", resource: "*", effect: "deny" }],
@@ -278,6 +289,15 @@ describe("classifyConfig", () => {
     const w = classifyConfig({ experimental: { policies: [], todo: true } })
     expect(w.legacy).toEqual(expect.arrayContaining([expect.stringContaining("experimental.policies")]))
     expect(w.unknown).toEqual([])
+  })
+
+  test("2.3.0 experimental flags are native", () => {
+    const w = classifyConfig({
+      experimental: { mcp_events: true, shell_timeout_background: true, codemode_vm: false },
+    })
+    expect(w.unknown).toEqual([])
+    expect(w.legacy).toEqual([])
+    expect(w.relaunch).toEqual(["experimental"])
   })
 
   test("flags V1-shaped policies, instructions and plugins containers", () => {
@@ -411,6 +431,13 @@ describe("startupInfo", () => {
     expect(startupInfo(config, ["plugins"], "").kind).toBe("pending")
   })
 
+  test("expectedLayered reports the profile the handoff says should be layered", () => {
+    expect(expectedLayered({ profile: "deep", startup: { kind: "layered", keys: ["plugins"] } })).toBe("deep")
+    expect(expectedLayered({ profile: "deep", startup: { kind: "pending", keys: ["plugins"] } })).toBeNull()
+    expect(expectedLayered({ profile: "deep" })).toBeNull()
+    expect(expectedLayered({ profile: null })).toBeNull()
+  })
+
   test("startupLabel renders the badge text", () => {
     expect(startupLabel(startupInfo(config, ["plugins", "lsp"]))).toBe("⟳ needs restart (2)")
     expect(startupLabel(startupInfo(config, ["plugins"], config))).toBe("✓ startup loaded")
@@ -473,6 +500,47 @@ describe("shared selection state", () => {
     })
   })
 
+  test("claimRelayer hands out one attempt at a time and stops after three", () => {
+    withConfig(() => {
+      writeSelection("deep", undefined, { kind: "layered", keys: ["plugins"] })
+
+      expect(claimRelayer("deep", 1_000)).toBe(true)
+      // Two clients on the same snapshot: only the first gets the token.
+      expect(claimRelayer("deep", 1_001)).toBe(false)
+      // The cooldown expires.
+      expect(claimRelayer("deep", 1_000 + RELAYER_COOLDOWN_MS)).toBe(true)
+      expect(claimRelayer("deep", 1_000 + RELAYER_COOLDOWN_MS * 2)).toBe(true)
+      // Three attempts is the cap, however long the client waits.
+      expect(claimRelayer("deep", 1_000 + RELAYER_COOLDOWN_MS * 10)).toBe(false)
+      expect(readSelectionState().relayer).toMatchObject({ profile: "deep", attempts: RELAYER_ATTEMPTS })
+    })
+  })
+
+  test("a switch starts the attempts over", () => {
+    withConfig(() => {
+      writeSelection("deep", undefined, { kind: "layered", keys: ["plugins"] })
+      claimRelayer("deep", 1_000)
+      expect(readSelectionState().relayer?.attempts).toBe(1)
+
+      writeSelection("fast", undefined, { kind: "layered", keys: ["plugins"] })
+      expect(readSelectionState().relayer).toBeUndefined()
+      expect(claimRelayer("fast", 1_001)).toBe(true)
+    })
+  })
+
+  test("a quiet stretch starts a new incident", () => {
+    withConfig(() => {
+      writeSelection("deep", undefined, { kind: "layered", keys: ["plugins"] })
+      const first = 1_000
+      for (let i = 0; i < RELAYER_ATTEMPTS; i++) claimRelayer("deep", first + i * RELAYER_COOLDOWN_MS)
+      const last = first + (RELAYER_ATTEMPTS - 1) * RELAYER_COOLDOWN_MS
+      expect(claimRelayer("deep", last + RELAYER_COOLDOWN_MS)).toBe(false)
+      // The layer stayed up long enough that the next drop is a new incident.
+      expect(claimRelayer("deep", last + RELAYER_RESET_MS + 1)).toBe(true)
+      expect(readSelectionState().relayer?.attempts).toBe(1)
+    })
+  })
+
   test("loadProfiles reads the object model form", () => {
     withConfig((dir) => {
       const profileDir = path.join(dir, "opencode", "profiles", "deep")
@@ -489,6 +557,44 @@ describe("shared selection state", () => {
       expect(profiles).toHaveLength(1)
       expect(profiles[0].defaultModel).toBe("anthropic/claude#high")
       expect(profiles[0].agentModels).toEqual([{ agent: "reviewer", model: "openai/gpt-5.4#low" }])
+    })
+  })
+
+  test("loadProfiles merges config agents with markdown agents", () => {
+    withConfig((dir) => {
+      const profileDir = path.join(dir, "opencode", "profiles", "ocO")
+      fs.mkdirSync(path.join(profileDir, "agents"), { recursive: true })
+      fs.writeFileSync(
+        path.join(profileDir, "agents", "explore.md"),
+        "---\nmode: subagent\n---\nexplore prompt",
+      )
+      fs.writeFileSync(
+        path.join(profileDir, "opencode.jsonc"),
+        JSON.stringify({
+          default_agent: "lead",
+          agents: {
+            lead: { system: "lead prompt", mode: "primary", model: "a/b", color: "#fff" },
+            explore: { model: "c/d", hidden: true },
+            plan: { disabled: true },
+          },
+        }),
+      )
+
+      const [profile] = loadProfiles()
+      expect(profile.agents.find((agent) => agent.name === "lead")).toMatchObject({
+        system: "lead prompt",
+        mode: "primary",
+        model: "a/b",
+        color: "#fff",
+      })
+      // The config model and hidden flag win; the markdown body stays the prompt.
+      expect(profile.agents.find((agent) => agent.name === "explore")).toMatchObject({
+        system: "explore prompt",
+        model: "c/d",
+        hidden: true,
+      })
+      expect(profile.disabledAgents).toEqual(["plan"])
+      expect(profile.declaredAgents.sort()).toEqual(["explore", "lead", "plan"])
     })
   })
 })
@@ -625,5 +731,204 @@ describe("agent markdown", () => {
     expect(agentMode("all")).toBe("all")
     expect(agentMode("orchestrator")).toBeUndefined()
     expect(agentMode(undefined)).toBeUndefined()
+  })
+})
+
+describe("agent definitions", () => {
+  test("config agents carry every native field", () => {
+    const [lead] = configAgents({
+      agents: {
+        lead: {
+          description: "d",
+          system: "prompt",
+          mode: "primary",
+          model: { providerID: "anthropic", model: "claude", variant: "high" },
+          hidden: true,
+          color: "#fff",
+          steps: 12,
+          disabled: true,
+          permissions: [{ action: "edit", resource: "**", effect: "deny" }],
+          request: { headers: { "x-y": "z" }, body: { temperature: 0.2 } },
+        },
+      },
+    })
+    expect(lead).toEqual({
+      name: "lead",
+      description: "d",
+      system: "prompt",
+      mode: "primary",
+      model: "anthropic/claude#high",
+      hidden: true,
+      color: "#fff",
+      steps: 12,
+      disabled: true,
+      permissions: [{ action: "edit", resource: "**", effect: "deny" }],
+      request: { headers: { "x-y": "z" }, body: { temperature: 0.2 } },
+    })
+  })
+
+  test("markdown frontmatter is parsed as YAML, body wins as the prompt", () => {
+    const agent = parseAgentMarkdown(
+      "reviewer",
+      [
+        "---",
+        "description: Reviews diffs",
+        "mode: subagent",
+        "model: openai/gpt-5.4#high",
+        "hidden: true",
+        "color: '#ff0000'",
+        "steps: 7",
+        "permissions:",
+        "  - action: edit",
+        "    resource: '**'",
+        "    effect: deny",
+        "request:",
+        "  headers:",
+        "    x-test: '1'",
+        "  body:",
+        "    temperature: 0.3",
+        "---",
+        "Body prompt.",
+      ].join("\n"),
+    )
+    expect(agent.description).toBe("Reviews diffs")
+    expect(agent.mode).toBe("subagent")
+    expect(agent.model).toBe("openai/gpt-5.4#high")
+    expect(agent.hidden).toBe(true)
+    expect(agent.color).toBe("#ff0000")
+    expect(agent.steps).toBe(7)
+    expect(agent.permissions).toEqual([{ action: "edit", resource: "**", effect: "deny" }])
+    expect(agent.request).toEqual({ headers: { "x-test": "1" }, body: { temperature: 0.3 } })
+    expect(agent.system).toBe("Body prompt.")
+  })
+
+  test("mode/ files force a primary agent", () => {
+    expect(parseAgentMarkdown("planner", "---\nmode: subagent\n---\nbody", { primary: true }).mode).toBe("primary")
+  })
+
+  test("mergeAgent keeps defined config fields over the file definition", () => {
+    const merged = mergeAgent(
+      { name: "lead", system: "file prompt", model: "a/b", color: "#111" },
+      { name: "lead", model: "c/d", hidden: true },
+    )
+    expect(merged).toEqual({ name: "lead", system: "file prompt", model: "c/d", color: "#111", hidden: true })
+  })
+
+  test("mergeAgent accumulates permissions and request settings", () => {
+    const merged = mergeAgent(
+      {
+        name: "lead",
+        permissions: [{ action: "read", resource: "*", effect: "allow" }],
+        request: { headers: { a: "1" }, body: { temperature: 0.2 } },
+      },
+      {
+        name: "lead",
+        permissions: [{ action: "edit", resource: "**", effect: "deny" }],
+        request: { headers: { b: "2" } },
+      },
+    )
+    // File rules first, config rules appended: last match wins, so the config
+    // entry still decides.
+    expect(merged.permissions).toEqual([
+      { action: "read", resource: "*", effect: "allow" },
+      { action: "edit", resource: "**", effect: "deny" },
+    ])
+    expect(merged.request).toEqual({ headers: { a: "1", b: "2" }, body: { temperature: 0.2 } })
+  })
+
+  test("steps must be a positive integer", () => {
+    const steps = (value: string) => parseAgentMarkdown("x", `---\nsteps: ${value}\n---\nbody`).steps
+    expect(steps("25")).toBe(25)
+    expect(steps("0")).toBeUndefined()
+    expect(steps("-3")).toBeUndefined()
+    expect(steps("2.5")).toBeUndefined()
+    expect(steps("many")).toBeUndefined()
+  })
+
+  test("readAgents survives a symlink loop", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "profile-agents-"))
+    try {
+      fs.mkdirSync(path.join(dir, "agents", "team"), { recursive: true })
+      fs.writeFileSync(path.join(dir, "agents", "team", "reviewer.md"), "---\nmode: subagent\n---\nreview")
+      fs.symlinkSync(path.join(dir, "agents"), path.join(dir, "agents", "team", "loop"))
+      expect(readAgents(dir).map((agent) => agent.name)).toEqual(["team/reviewer"])
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("readAgents discovers agent/, agents/, mode/ and nested files", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "profile-agents-"))
+    try {
+      fs.mkdirSync(path.join(dir, "agent"), { recursive: true })
+      fs.mkdirSync(path.join(dir, "agents", "team"), { recursive: true })
+      fs.mkdirSync(path.join(dir, "modes"), { recursive: true })
+      fs.writeFileSync(path.join(dir, "agent", "solo.md"), "---\nmode: subagent\n---\nsolo")
+      fs.writeFileSync(path.join(dir, "agents", "team", "reviewer.md"), "---\nmode: subagent\n---\nreview")
+      fs.writeFileSync(path.join(dir, "modes", "planner.md"), "---\nmode: subagent\n---\nplan")
+      const agents = readAgents(dir)
+      expect(agents.map((agent) => agent.name).sort()).toEqual(["planner", "solo", "team/reviewer"])
+      expect(agents.find((agent) => agent.name === "planner")?.mode).toBe("primary")
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("config substitution", () => {
+  test("resolves {file:} relative to the config and {env:}", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "profile-config-"))
+    try {
+      fs.writeFileSync(path.join(dir, "prompt.md"), "  Hello  \n")
+      process.env.PROFILE_SWITCHER_TEST = "from-env"
+      const text = '{"system":"{file:prompt.md}","env":"{env:PROFILE_SWITCHER_TEST}"}'
+      expect(JSON.parse(substituteConfigText(text, dir))).toEqual({ system: "Hello", env: "from-env" })
+    } finally {
+      delete process.env.PROFILE_SWITCHER_TEST
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("readConfigJsonc parses a config with a file prompt", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "profile-config-"))
+    try {
+      fs.writeFileSync(path.join(dir, "prompt.md"), "Prompt body")
+      fs.writeFileSync(
+        path.join(dir, "opencode.jsonc"),
+        '{ "agents": { "lead": { "system": "{file:prompt.md}" } } }',
+      )
+      expect(readConfigJsonc(path.join(dir, "opencode.jsonc"))?.agents.lead.system).toBe("Prompt body")
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("canonical config paths", () => {
+  test("expands ~ and resolves symlinks", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "profile-path-"))
+    try {
+      const real = path.join(dir, "real.jsonc")
+      const link = path.join(dir, "link.jsonc")
+      fs.writeFileSync(real, "{}")
+      fs.symlinkSync(real, link)
+      expect(canonicalConfigPath(link)).toBe(canonicalConfigPath(real))
+      expect(canonicalConfigPath("~/x")).toBe(path.join(os.homedir(), "x"))
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("startupInfo treats a symlinked path as layered", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "profile-path-"))
+    try {
+      const real = path.join(dir, "opencode.jsonc")
+      const link = path.join(dir, "link.jsonc")
+      fs.writeFileSync(real, "{}")
+      fs.symlinkSync(real, link)
+      expect(startupInfo(real, ["plugins"], link).kind).toBe("layered")
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
   })
 })

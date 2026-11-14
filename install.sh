@@ -1,22 +1,17 @@
 #!/bin/sh
-# Local development install for opencode-profile-switcher (OpenCode 2.2.7+).
-# Use this when you are editing the plugin; install from GitHub otherwise:
-#   opencode plugin add github:Nejrup/opencode-profile-switcher
+# Local development install for opencode-profile-switcher (OpenCode 2.3.0+).
 #
-# One entry loads every part in 2.2.7: the server part from `.`, the TUI part
-# from `./tui`, the desktop GUI from `./gui-experimental`, and the RPC contract
-# from `./rpc`. You no longer need to add the package to cli.json.
+# 2.3.0 cannot install a local checkout through `opencode plugin add`:
+#   - an absolute path is rejected (npm or Git spec only);
+#   - a Git spec fails in dep preparation, because the installer runs its
+#     bundled npm through the opencode binary ("Unrecognized flag: --force").
+# So the dev install is one absolute path in the global config's `plugins`
+# array. This script builds the GUI bundle and prints the exact entry.
 #
-# The desktop app loads only the GUI bundle, which is committed at
-# dist/gui-experimental.cjs. This script rebuilds it before committing, so a
-# local install always matches src/.
-#
-# Requirements: the plugin folder must be a git repo (git+file installs a
-# clone of HEAD), and `opencode` must be on PATH.
+# Requirements: bun (for the GUI build) and a global opencode.json(c).
 set -e
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-spec="git+file://$here"
 
 if command -v bun >/dev/null 2>&1; then
   echo "1) building the desktop GUI bundle..."
@@ -25,24 +20,43 @@ else
   echo "1) bun not found — using the committed dist/gui-experimental.cjs"
 fi
 
-echo "2) committing working tree (git+file installs a clone of HEAD)..."
-git -C "$here" add -A
-git -C "$here" diff --cached --quiet || git -C "$here" commit -q -m "chore: install/update snapshot"
-echo "   HEAD: $(git -C "$here" rev-parse --short HEAD)"
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
+config=""
+for name in opencode.jsonc opencode.json; do
+  if [ -f "$config_dir/$name" ]; then
+    config="$config_dir/$name"
+    break
+  fi
+done
 
-if ! opencode plugin list 2>/dev/null | grep -q "profile-switcher"; then
-  echo "3) registering the plugin with the service (opencode.jsonc)..."
-  opencode plugin add "$spec"
+if [ -z "$config" ]; then
+  echo "2) no global config found under $config_dir"
+  echo "   create opencode.jsonc with:"
+  echo
+  echo "     { \"plugins\": [\"$here\"] }"
+  exit 0
+fi
+
+if grep -Fq "\"$here\"" "$config"; then
+  echo "2) already registered in $config"
 else
-  echo "3) already registered — refresh with \`opencode plugin update\`"
+  echo "2) add this entry to the \"plugins\" array in $config:"
+  echo
+  echo "     \"$here\""
+  echo
+  echo "   (and remove any stale npm/Git spec for this plugin)"
 fi
 
 cat <<EOF
 
-Done. Restart the service once so the server picks up the new config:
+3) restart the service so the server picks up the plugin:
 
-  opencode service restart
+     opencode service restart
 
-Dev loop after editing src/:  git commit  →  opencode plugin update
-(or remove + add) and reopen the TUI / desktop window.
+Then check it loaded:
+
+     opencode plugin list        # profile-switcher, source $here
+     opencode plugin check
+
+Dev loop after editing src/:  bun run build  ->  opencode service restart
 EOF

@@ -11,7 +11,6 @@ export const messages = {
   "picker.search": "Search profiles",
   "picker.base": "Base config",
   "picker.base.description": "No profile overlay",
-  "picker.pending": "needs restart: {{keys}}",
   "picker.warnings": "{{count}} field(s) ignored",
   "picker.unavailable": "The profile-switcher server half is not reachable yet.",
 
@@ -57,5 +56,4 @@ export const messages = {
   "profile.pending": "⟳ needs restart: {{keys}}",
   "profile.layered": "✓ startup loaded",
   "profile.agents": "{{count}} agents",
-  "profile.description": "Applied live: {{keys}}",
 } as const

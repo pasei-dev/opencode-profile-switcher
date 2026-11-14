@@ -8,7 +8,7 @@
 
 import { Rpc } from "@opencode/plugin/rpc"
 
-import type { BusyResult, RestartPolicy, Snapshot } from "./types.ts"
+import type { BusyResult, ClaimResult, RestartPolicy, Snapshot } from "./types.ts"
 
 const policy = { enum: ["ask", "always", "never"] } as const
 
@@ -62,13 +62,14 @@ const snapshot = {
   properties: {
     active: nullableString,
     layered: nullableString,
+    expected: nullableString,
     policy,
     policyStored: { type: "boolean" },
     profilesRoot: { type: "string" },
     busy: { type: "boolean" },
     profiles: { type: "array", items: profileView },
   },
-  required: ["active", "layered", "policy", "policyStored", "profilesRoot", "busy", "profiles"],
+  required: ["active", "layered", "expected", "policy", "policyStored", "profilesRoot", "busy", "profiles"],
   additionalProperties: false,
 } as const
 
@@ -112,6 +113,25 @@ export const Profiles = Rpc.define({
     },
     /** Whether a turn is running; a desktop restart waits for this to be false. */
     busy: { input: noInput, output: busyResult },
+    /**
+     * Ask the server for the right to restore a dropped layer. The handoff file
+     * is shared, so this is what keeps two clients from bouncing the service at
+     * the same time — and keeps either from doing it forever.
+     */
+    claimRestart: {
+      input: {
+        type: "object",
+        properties: { profile: { type: "string" } },
+        required: ["profile"],
+        additionalProperties: false,
+      },
+      output: {
+        type: "object",
+        properties: { allowed: { type: "boolean" } },
+        required: ["allowed"],
+        additionalProperties: false,
+      },
+    },
   },
   events: {
     changed: {
@@ -134,4 +154,5 @@ export type ProfilesRpc = typeof Profiles
 /** Narrow the RPC's `unknown` results without repeating the cast at every call site. */
 export const asSnapshot = (value: unknown): Snapshot => value as Snapshot
 export const asBusy = (value: unknown): BusyResult => value as BusyResult
+export const asClaim = (value: unknown): ClaimResult => value as ClaimResult
 export const asPolicy = (value: unknown): RestartPolicy => value as RestartPolicy

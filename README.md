@@ -33,7 +33,7 @@ schematic — TUI picker, desktop menu and footer badge, not a screenshot
 | **Reports** | which fields are V1-but-normalized, which V2 ignores — each with the fix |
 | **Writes** | nothing in your config; only the picker's own handoff file |
 
-OpenCode **2.2.7+** only (V1 has no plugin API for this). MIT licensed.
+OpenCode **2.3.0+** only (V1 has no plugin API for this). MIT licensed.
 
 <details>
 <summary>Contents</summary>
@@ -54,14 +54,34 @@ OpenCode **2.2.7+** only (V1 has no plugin API for this). MIT licensed.
 
 ## Install
 
+A local checkout (what `./install.sh` sets up):
+
+```jsonc title="~/.config/opencode/opencode.jsonc"
+{
+  "plugins": ["/absolute/path/to/profile-switcher"]
+}
+```
+
 ```sh
-opencode plugin add github:Nejrup/opencode-profile-switcher
 opencode service restart
 ```
 
-That is the whole install. In 2.2.7 one `plugins` entry loads every part of the
-package: the server half, the TUI half, the desktop GUI half and the RPC
-contract. You do **not** need to add it to `cli.json` any more.
+A published package, once it exists on npm:
+
+```sh
+opencode plugin add @your-scope/opencode-profile-switcher
+opencode service restart
+```
+
+One `plugins` entry loads every part of the package in 2.3.0: the server half,
+the TUI half, the desktop GUI half and the RPC contract. You do **not** need to
+add it to `cli.json`.
+
+> **2.3.0 installer:** `opencode plugin add` accepts only npm and Git specs, and
+> a Git install still fails with `git dep preparation failed` / `Unrecognized
+> flag: --force in command opencode` — the installer runs its bundled npm
+> through the `opencode` binary. Use the absolute-path form above for a local
+> checkout; it needs no installer.
 
 If the desktop app does not show the profile pill after the restart, relaunch
 the app once so its main process re-reads the plugin list.
@@ -71,7 +91,7 @@ Check it took:
 ```sh
 opencode plugin list
 # ID                VERSION  SOURCE
-# profile-switcher  <sha>    github:Nejrup/opencode-profile-switcher
+# profile-switcher  -        /absolute/path/to/profile-switcher
 ```
 
 `opencode plugin check` prints the server and TUI rows side by side, and
@@ -83,9 +103,10 @@ Open the TUI, press `<leader>p` (leader defaults to `ctrl+x`, so `ctrl+x` then
 In the desktop app, the same profiles appear in the titlebar pill, the project
 menu, the command palette and Settings › Profiles.
 
-> **Pin a version:** append a ref — `github:Nejrup/opencode-profile-switcher#v2.0.0`.
-> An unpinned spec tracks the default branch and `opencode plugin update` moves it;
-> exact versions and full commit hashes stay put and are skipped by update checks.
+> **Pin a version:** once the installer bug above is fixed, append a ref —
+> `github:Nejrup/opencode-profile-switcher#v2.0.0`. An unpinned spec tracks the
+> default branch and `opencode plugin update` moves it; exact versions and full
+> commit hashes stay put and are skipped by update checks.
 
 ## Make a profile
 
@@ -96,10 +117,17 @@ A profile is a directory with a config in it:
 └── deep/
     ├── opencode.jsonc        ← the overlay
     ├── profile.jsonc         ← optional picker label/description
+    ├── prompts/              ← optional, referenced with {file:…}
+    │   └── architect.md
     └── agents/
-        ├── architect.md      ← agent definitions, loaded live
-        └── explorer.md
+        └── explorer.md       ← agent definitions, loaded live
 ```
+
+Agents can be declared either way, and both are read live: `agents` keys in the
+profile config, or markdown files under `agent/`, `agents/`, `mode/` or `modes/`
+(nested files become `team/reviewer`; `mode/` files are always primary). A
+config entry wins per field, so the prompt can live in `agents/explore.md` while
+`opencode.jsonc` overrides just its model.
 
 ```jsonc title="~/.config/opencode/profiles/deep/opencode.jsonc"
 {
@@ -107,7 +135,7 @@ A profile is a directory with a config in it:
   "default_agent": "architect",
   "model": "anthropic/claude-opus-4-7",
   "agents": {
-    "architect": { "model": "anthropic/claude-opus-4-7" },
+    "architect": { "model": "anthropic/claude-opus-4-7", "system": "{file:./prompts/architect.md}" },
     "explorer": { "model": "anthropic/claude-haiku-4-5", "mode": "subagent" },
     "build": { "disabled": true },
   },
@@ -186,8 +214,8 @@ client stays in sync.
 
 | Profile key | Applied live through |
 | --- | --- |
-| `agents` | `agent.transform` — `disabled` → hidden, `model` → override |
-| `agents/*.md` | upserted as agents; the previous profile's are hidden again |
+| `agents` | `agent.transform` — every field of the entry: prompt, `mode`, `model`, `color`, `steps`, `hidden`, `permissions`, `request`; `disabled` → hidden |
+| `agent/*.md`, `agents/*.md`, `mode/*.md`, `modes/*.md` | upserted as agents, nested files included; the previous profile's are hidden again |
 | `default_agent` | `agent.transform` → `draft.default()` |
 | `model` | `model.transform` → `default.set()` (string or object form) |
 | `mcp.servers` | `mcp.transform` → `editor.set()` |
@@ -323,8 +351,9 @@ Nested damage is caught too — `providers.acme.npm`, `compaction.prune`,
 `experimental.continue_loop_on_deny`, `experimental.policies`,
 `agents.*.disable`, `mcp` servers not under `servers`, `skills` as an object,
 `plugins` as an object. The native key set comes from the contract the server
-itself serves (`opencode api get /openapi.json` → `Config.Info`, 30 properties in
-2.2.7), not from `https://opencode.ai/config.json`, which still describes V1.
+itself serves (`opencode api get /openapi.json` → `Config.Info`, 29 keys plus
+`$schema` in 2.3.0), not from `https://opencode.ai/config.json`, which still
+describes V1.
 
 Profiles are read in **native V2 shapes only** — the switcher reports V1 keys
 rather than guessing at a translation.
@@ -333,16 +362,17 @@ rather than guessing at a translation.
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| No `<leader>p`, no "Switch profile" in the palette | terminal half missing | make sure the package is in `opencode.json(c)` `plugins` (2.2.7 loads the TUI part from there), then `opencode service restart` |
+| No `<leader>p`, no "Switch profile" in the palette | terminal half missing | make sure the package is in `opencode.json(c)` `plugins` (2.3.0 loads the TUI part from there), then `opencode service restart` |
 | Listed in `plugin list` but no `/profile` command | server half not loaded yet | `opencode api get /api/plugin` → `state` should be `active`; restart the service |
 | Desktop app shows no profile pill or Settings page | the installed copy has no `./gui-experimental` bundle, or the GUI is switched off | `opencode api get /api/plugin` → `features.gui` must be `true`; Settings › Extensions › Plugins must have it enabled |
 | `/plugins` shows a failure marker on it | resolved a bad copy, or you edited a local install | `opencode plugin update`; if it sticks, `rm -rf ~/.cache/opencode/npm/git-*profile-switcher-*` and re-add |
-| `opencode plugin update` fails with `git dep preparation failed` / `Unrecognized flag: --prefer-offline` | a 2.2.7 CLI bug runs its bundled npm through the opencode binary, which rejects npm flags | update with `npm install github:Nejrup/opencode-profile-switcher` in the plugin cache, or remove and re-add the plugin; the plugin itself is fine |
+| `opencode plugin update` fails with `git dep preparation failed` / `Unrecognized flag: --force in command opencode` | a 2.3.0 CLI bug runs its bundled npm through the opencode binary, which rejects npm flags | register an absolute path in `plugins` instead (see [Install](#install)); the plugin itself is fine |
+| `plugin list` shows the plugin with `-` id and version | the spec could not be installed (404 npm package, or the Git installer bug) | check `~/.local/share/opencode/log/opencode.log` for `failed to load plugin`; fix the `plugins` entry and restart the service |
 | Applied a profile but agents/models did not change | profile uses V1 `agent:` / `permission:` keys | rename to `agents` / `permissions` — the switch report lists exactly which |
-| Agents appear with no prompt | `agents/<name>.md` missing or unreadable | add the file; the picker counts how many agents were loaded |
+| Agents appear with no prompt | the agent is declared in `agents` with no `system` and there is no matching markdown file | give the entry a `system` (`{file:./prompts/x.md}` works) or add `agents/x.md`; the picker counts how many agents were loaded |
 | Profile sets `plugins` / `compaction` and nothing moves | those are read at server start | with the default **always** policy the service bounces for you; desktop Settings → Restart to force it, or `/profile restart` for the command |
 | Switched profiles but no restart happened | a turn was running, so the restart is deferred | the TUI fires on `session.idle`; the desktop app polls `busy`; the `⟳` marker stays until it does |
-| `⟳ needs restart` will not become `✓ startup loaded` | the service was started without the layered config | restart from the picker or Settings (they set `OPENCODE_CONFIG`), or run the command `/profile restart` prints |
+| `⟳ needs restart` will not become `✓ startup loaded` | the service was started without the layered config | under **always** the clients re-layer on their next refresh; otherwise restart from the picker or Settings (they set `OPENCODE_CONFIG`), or run the command `/profile restart` prints |
 | Restart prompt never appears | the policy is **always** (restarts without asking) or **never** (label only) | TUI palette → "Profile restart policy", or Settings › Profiles |
 | Terminal stops responding after a restart | the client did not rediscover the service | relaunch `opencode` — sessions and history are on disk |
 | `could not restart the service` toast | the CLI is not the running binary (wrapper, `bun`, a shim) | set `OPENCODE_BIN` to the real `opencode` executable |
@@ -363,7 +393,10 @@ rather than guessing at a translation.
 - **The layered config lives in the service's environment.** Other `opencode`
   commands you start yourself (a `--standalone` run, a script) do not inherit
   it; they read the same profile only if you pass `OPENCODE_CONFIG` too. The
-  desktop app's own server restart also drops the layer until you switch again.
+  desktop app's own server start also drops the layer — under the default
+  **always** policy the TUI and the desktop app restore it on their next
+  refresh (one client at a time, at most three automatic attempts, then the `⟳`
+  marker and the restart command stand).
 - **Desktop restarts use the standard service command.** An isolated desktop
   server (`OPENCODE_DESKTOP_ISOLATED_SERVER`) or a remote server may need a
   manual restart with the profile layered in.
@@ -381,8 +414,8 @@ rather than guessing at a translation.
 
 ```sh
 bun install
-bun run typecheck   # tsc --noEmit against the real @opencode/plugin 2.2.7 types
-bun test            # 60 tests: refs, permission precedence, field lint, references, startup, agents, frontmatter, shared state, GUI bundle
+bun run typecheck   # tsc --noEmit against the real @opencode/plugin 2.3.0 types
+bun test            # 61 tests: refs, permission precedence, field lint, references, startup, agents, frontmatter, shared state, GUI bundle
 bun run build       # dist/gui-experimental.cjs for the desktop app
 bun run check       # all three
 ```
@@ -391,9 +424,10 @@ bun run check       # all three
 build, and the desktop app needs a prebuilt CommonJS bundle. Rebuild and commit
 it with any GUI change.
 
-Iterate without pushing: `./install.sh` rebuilds the GUI, registers this checkout
-with `git+file://`, then the loop is `git commit` → `opencode plugin update` →
-`opencode service restart`.
+Iterate without pushing: `./install.sh` rebuilds the GUI and prints the
+absolute-path `plugins` entry for this checkout (2.3.0 cannot install a local
+path through `opencode plugin add`). The loop is: edit `src/` → `bun run build`
+→ `opencode service restart`.
 
 Release: bump `version`, run `bun run build`, commit `dist/`, tag, push,
 `gh release create`, and an unpinned install picks it up with

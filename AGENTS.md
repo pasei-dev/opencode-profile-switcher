@@ -1,7 +1,7 @@
 # AGENTS.md — contributor notes
 
 Working notes for anyone changing this plugin. The user-facing behaviour is in
-[README.md](./README.md); this file is about the OpenCode **2.2.7** plugin
+[README.md](./README.md); this file is about the OpenCode **2.3.0** plugin
 contract, where each behaviour lives, and how to verify a change against a
 running server.
 
@@ -31,7 +31,7 @@ no filesystem access and reads the same data through RPC.
 
 ## The three halves
 
-One package, one `plugins` entry in `opencode.json(c)` (2.2.7 loads every part
+One package, one `plugins` entry in `opencode.json(c)` (2.3.0 loads every part
 from the same entry):
 
 - `.` — server, `@opencode/plugin`
@@ -64,9 +64,13 @@ first paint.
 
 ## Contract gotchas (each one bit us once)
 
-- **2.2.7 renamed `ctx.catalog` to `ctx.model`.** The model editor is
+- **2.3.0 keeps the 2.2.7 plugin API.** `ctx.catalog` is still `ctx.model`; the
+  model editor is
   `ctx.model.transform((editor) => editor.default.set(providerID, modelID))`.
-  There is no host/SDK skew guard any more: this release targets 2.2.7.
+  There is no host/SDK skew guard: this release targets 2.3.0. New in 2.3.0 and
+  unused here: the `session.fork` hook, `SessionRequestMessage.metadata`, the
+  integration OAuth `submit` paste path, and cooperative tool cancellation via
+  `ToolContext.signal`.
 - **RPC is `ctx.rpc.register(definition, handlers)`.** The same definition is
   imported by the TUI (`context.client.rpc(Profiles)`) and the GUI
   (`ctx.client.rpc(Profiles)`). JSON Schema keeps `src/rpc.ts` free of Node and
@@ -156,17 +160,66 @@ The native key set tracks the **contract the server serves**, not the published
 schema:
 
 ```sh
-opencode api get /openapi.json   # components.schemas.Config.Info (30 props in 2.2.7)
+opencode api get /openapi.json   # components.schemas.Config.Info (29 keys + $schema in 2.3.0)
 ```
 
 2.2.7 added `timezone` and top-level `policies`; `experimental.policies` is
 deprecated (still accepted, reported as legacy). `skills`, `instructions` and
-`plugins` are arrays. `compaction` gained `tokens`. The
+`plugins` are arrays. `compaction` gained `tokens`. 2.3.0 added the experimental
+flags `mcp_events` and `shell_timeout_background` (both in `V2_EXPERIMENTAL`).
+The
 [config docs](https://opencode.ai/v2/docs/config) are the source for the
 `legacy` and `adapted` tables.
 
 When you add a key: put it in the right `Set`, add a nested lint via `lintNested`
 if it has a closed member set, and extend `test/profiles.test.ts`.
+
+## Agents (both native sources)
+
+V2 defines an agent in two ways, and a profile may use either or both:
+
+- `agents.<name>` in `opencode.jsonc` — the only way to carry a prompt without
+  a file, through `system: "{file:./prompts/lead.md}"`;
+- markdown under `agent/`, `agents/`, `mode/` or `modes/` (and the `.opencode/`
+  equivalents), nested files included. `mode/` and `modes/` force
+  `mode: "primary"`, exactly like core's `legacySources`.
+
+`loadProfiles` merges the two into `Profile.agents`: markdown first, then the
+config entry over it per defined field, so a profile can keep the prompt in a
+file and override only the model. `src/index.ts` then creates or updates every
+one of them in `ctx.agent.transform` — `draft.update` inserts a missing agent,
+which is why a config-only profile works live without an `agents/` directory.
+
+Config text is read with `readConfigJsonc`, which mirrors core's
+`ConfigVariable.substitute`: `{env:VAR}` and `{file:path}` (relative to the
+config, trimmed, JSON-escaped; a missing file substitutes empty). Without it a
+`{file:}` prompt would reach the transform as a literal token.
+
+Frontmatter is parsed as real YAML (`yaml`), so nested `permissions` and
+`request` survive; a parse failure falls back to the scalar reader rather than
+dropping the agent. `disabled: true` only ever hides an existing agent — it
+never creates one, because a session bound to it must stay resolvable.
+
+## Installing this checkout
+
+2.3.0's `opencode plugin add` accepts only npm and Git specs: an absolute path is
+rejected with "Plugin target must be an npm registry package or Git package
+specifier". A Git spec (`github:…`, `git+file://…`) still fails during dep
+preparation because the installer runs its bundled npm through the `opencode`
+binary (`Unrecognized flag: --force in command opencode`). Both were reproduced
+on 2.3.0.
+
+So a dev install is a hand-written absolute path in the global config:
+
+```jsonc
+{ "plugins": ["/absolute/path/to/profile-switcher"] }
+```
+
+The server resolves it directly (`source.type: "local"` in `/api/plugin`), and
+the TUI and desktop app pick up their halves from the same entry. `install.sh`
+builds the GUI and prints the entry; it does not call `opencode plugin add`.
+`cli.json` must not list the plugin — 2.3.0 loads the TUI part from the server's
+plugin list, and a stale entry there fails independently.
 
 ## Verifying against a live server
 
@@ -252,15 +305,57 @@ lost; the profile's live keys stay applied.
 ## Startup layering (the restart flow)
 
 V2 has no "apply config at runtime" API, but the server reads one extra config
-document at startup from `OPENCODE_CONFIG`. Verified on 2.2.7: with
+document at startup from `OPENCODE_CONFIG`. Verified on 2.3.0: with
 `OPENCODE_CONFIG=<profile>/opencode.jsonc` the profile appears in `/api/config`
-as the **last** document, above `<config>/opencode.jsonc` and the directory
-sources, so its keys win and its `plugins` / `providers` / `compaction` are real.
+above `<config>/opencode.jsonc` and the directory sources, so its keys win over
+the base config and its `plugins` / `providers` / `compaction` are real.
+
+2.3.0's load order is **global → explicit (`OPENCODE_CONFIG`) → project →
+`OPENCODE_CONFIG_CONTENT` → managed policies** (see
+`packages/core/test/config/config.test.ts`, "loads explicit file and content
+overrides in priority order"). Two consequences:
+
+- a project `opencode.jsonc` outranks the layered profile, and
+- an `OPENCODE_CONFIG_CONTENT` injected by a host (the desktop app or an agent
+  runtime) outranks both. Unset it when verifying layering, or its document
+  wins for overlapping keys.
 
 The server reports the verdict over RPC (`restart: "none" | "pending" |
 "layered"` and `layered: <name> | null`), because only the server process knows
 its own environment. `layeredProfileName()` answers even for a profile with no
 startup-only keys; `startupInfo()` carries the keys and the exact command.
+
+`apply` writes the handoff **before** the restart, so the record says `pending`
+at the moment the new server boots. The server corrects it to `layered` in
+`setup` when it finds itself started with that profile's config, which is what
+lets a client's first paint show `✓` instead of a stale `⟳`.
+
+`Snapshot.expected` is the profile the handoff record says *should* be layered;
+`Snapshot.layered` is what the running server actually got. They differ when a
+host restarts the service with its own environment — the desktop app does, ~25 s
+after a switch — and that gap is what the clients act on:
+
+- under `always`, the TUI and the desktop window call their relayer on refresh,
+  which restarts the service with `OPENCODE_CONFIG` again;
+- the decision is `snap.expected === snap.active`, i.e. the server's record, not
+  the client's memory: a client that remembers an older profile would race the
+  switch another client just made;
+- before restarting, a client asks the server for a claim (`claimRestart` →
+  `claimRelayer`). The token lives in the handoff file (`relayer: { profile, at,
+  attempts }`), so two windows cannot bounce the service at the same time, and
+  the cooldown (`RELAYER_COOLDOWN_MS`) and cap (`RELAYER_ATTEMPTS`, 3) are
+  shared rather than counted per client;
+- the cap is **not** reset by a layered boot. The host this guards against
+  restarts the service and drops the layer again seconds later, so a boot would
+  hand out a fresh set of attempts every cycle. A profile switch drops the
+  record (`writeState`), and a quiet stretch of `RELAYER_RESET_MS` (10 min)
+  counts as a new incident;
+- the relayer never fires while `busy`, and never when the policy is `ask` or
+  `never`.
+
+Path comparison for all of this goes through `canonicalConfigPath()`
+(`~`/`$HOME` expansion plus `realpath`), because a service started with a
+symlinked or `~`-spelled path is still layered.
 
 - restart policy is `"ask" | "always" | "never"`, stored in the handoff file and
   shared by the TUI and the desktop app. The default is `always`. The TUI
@@ -281,14 +376,17 @@ terminates your own session. Verify with a private server instead, which does no
 touch the managed service:
 
 ```sh
+unset OPENCODE_CONFIG_CONTENT      # it outranks OPENCODE_CONFIG in 2.3.0
+OPENCODE_PASSWORD=testpass \
 OPENCODE_CONFIG=$HOME/.config/opencode/profiles/deep/opencode.jsonc \
-  opencode serve --port 40098 --print-logs > /tmp/serve.log 2>&1 &
-sleep 6                       # then take "server password …" from /tmp/serve.log
-curl -s -u "opencode:$PASS" http://127.0.0.1:40098/api/config \
+  opencode serve --port 40098 > /tmp/serve.log 2>&1 &
+sleep 6
+curl -s -u "opencode:testpass" http://127.0.0.1:40098/api/config \
   | jq -r '.[] | select(.type=="document") | .path'
 ```
 
-The profile path must be listed, and last. Kill that process when you are done.
+The profile path must be listed after the global document. Kill that process
+when you are done.
 
 ## House rules
 

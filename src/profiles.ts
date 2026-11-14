@@ -15,6 +15,7 @@ import os from "node:os"
 import path from "node:path"
 
 import { Model } from "@opencode/schema"
+import { parse as parseYaml } from "yaml"
 
 import type { RestartPolicy, StartupInfo, StartupKind } from "./types.ts"
 
@@ -48,7 +49,25 @@ export type SelectionState = {
   sessionID?: string
   startup?: StartupInfo
   policy?: RestartPolicy
+  /** Automatic re-layer bookkeeping, shared by every client. */
+  relayer?: RelayerState
 }
+
+/**
+ * How many times the clients may restore a dropped layer on their own, how far
+ * apart, and how long the layer must stay quiet before a new incident starts.
+ * All three live in the handoff file, so two windows cannot bounce the service
+ * at the same time — or keep bouncing it forever.
+ *
+ * The reset is deliberately *not* a layered boot: the host this guards against
+ * restarts the service and then drops the layer again seconds later, so a boot
+ * would hand out a fresh set of attempts every cycle.
+ */
+export const RELAYER_ATTEMPTS = 3
+export const RELAYER_COOLDOWN_MS = 30_000
+export const RELAYER_RESET_MS = 10 * 60_000
+
+export type RelayerState = { profile: string; at: number; attempts: number }
 
 function isPolicy(value: unknown): value is RestartPolicy {
   return value === "ask" || value === "always" || value === "never"
@@ -57,6 +76,7 @@ function isPolicy(value: unknown): value is RestartPolicy {
 export function readSelectionState(): SelectionState {
   const parsed = readJsonc(stateFile())
   const startup = parsed?.startup
+  const relayer = parsed?.relayer
   return {
     profile: typeof parsed?.profile === "string" ? parsed.profile : null,
     sessionID: typeof parsed?.sessionID === "string" ? parsed.sessionID : undefined,
@@ -69,6 +89,14 @@ export function readSelectionState(): SelectionState {
           }
         : undefined,
     policy: isPolicy(parsed?.policy) ? parsed.policy : undefined,
+    relayer:
+      relayer && typeof relayer === "object" && typeof relayer.profile === "string"
+        ? {
+            profile: relayer.profile,
+            at: Number(relayer.at) || 0,
+            attempts: Number(relayer.attempts) || 0,
+          }
+        : undefined,
   }
 }
 
@@ -84,6 +112,8 @@ function writeState(state: SelectionState): void {
   // The server's verdict on startup keys, echoed for clients to read.
   if (state.startup) body.startup = state.startup
   if (state.policy) body.policy = state.policy
+  // Attempts belong to the profile they were made for; a switch starts fresh.
+  if (state.relayer && state.relayer.profile === state.profile) body.relayer = state.relayer
   // Write-then-rename, so the watcher never reads a half-written file.
   const temp = `${file}.${process.pid}.${Date.now()}.tmp`
   fs.writeFileSync(temp, JSON.stringify(body), "utf8")
@@ -98,6 +128,33 @@ export function writeSelection(name: string | null, sessionID?: string, startup?
 /** Stores the restart policy shared by every client. */
 export function writePolicy(policy: RestartPolicy): void {
   writeState({ ...readSelectionState(), policy })
+}
+
+/**
+ * Claim the right to restore a dropped layer. The handoff file is shared by
+ * every client, so this is what stops two windows from bouncing the service at
+ * the same time, and what stops any of them from doing it forever. A quiet
+ * stretch longer than `RELAYER_RESET_MS` counts as a new incident.
+ */
+export function claimRelayer(profile: string, now = Date.now()): boolean {
+  const state = readSelectionState()
+  const previous = state.relayer?.profile === profile ? state.relayer : undefined
+  const fresh = !previous || now - previous.at > RELAYER_RESET_MS
+  const attempts = fresh ? 0 : previous.attempts
+  if (attempts >= RELAYER_ATTEMPTS) return false
+  if (!fresh && now - previous.at < RELAYER_COOLDOWN_MS) return false
+  writeState({ ...state, relayer: { profile, at: now, attempts: attempts + 1 } })
+  return true
+}
+
+/**
+ * The profile the handoff record says should be layered. `apply` writes the
+ * record before the restart, so it outlives a service that comes back without
+ * the layer (the desktop app starts its own server with its own environment).
+ * Clients use it to put the layer back rather than leaving ⟳ stuck forever.
+ */
+export function expectedLayered(state: SelectionState): string | null {
+  return state.startup?.kind === "layered" ? state.profile : null
 }
 
 // --- JSONC -----------------------------------------------------------------
@@ -161,6 +218,59 @@ export function readJsonc(file: string): any | undefined {
   }
 }
 
+/** Expand `~` and `$HOME` the way OpenCode expands config paths. */
+export function expandHome(value: string): string {
+  if (value === "~" || value === "$HOME") return os.homedir()
+  if (value.startsWith("~/")) return path.join(os.homedir(), value.slice(2))
+  if (value.startsWith("$HOME/")) return path.join(os.homedir(), value.slice(6))
+  return value
+}
+
+/**
+ * Core substitutes `{env:VAR}` and `{file:path}` in config text before parsing.
+ * Mirror it here: a profile agent whose prompt is `{file:./prompts/lead.md}`
+ * must reach the agent transform as text, not as a literal token.
+ */
+export function substituteConfigText(text: string, dir: string, escapeEnv = false): string {
+  const withEnv = text.replace(/\{env:([^}]+)\}/g, (_, name: string) => {
+    const value = process.env[name] ?? ""
+    return escapeEnv ? JSON.stringify(value).slice(1, -1) : value
+  })
+  return withEnv.replace(/\{file:([^}]+)\}/g, (token, raw: string, offset: number, whole: string) => {
+    // A reference in a line comment is documentation, not a file to read.
+    const lineStart = whole.lastIndexOf("\n", offset - 1) + 1
+    if (whole.slice(lineStart, offset).trimStart().startsWith("//")) return token
+    const expanded = expandHome(raw)
+    const resolved = path.isAbsolute(expanded) ? expanded : path.resolve(dir, expanded)
+    try {
+      return JSON.stringify(fs.readFileSync(resolved, "utf8").trim()).slice(1, -1)
+    } catch {
+      // Like core: a missing reference substitutes empty instead of failing the
+      // whole profile.
+      return ""
+    }
+  })
+}
+
+/**
+ * Read a config document with `{env:}` / `{file:}` substitution. Core first
+ * substitutes raw values and retries with JSON-escaped ones only when the
+ * result no longer parses, so configs that work today keep their meaning.
+ */
+export function readConfigJsonc(file: string): any | undefined {
+  try {
+    const text = fs.readFileSync(file, "utf8")
+    const dir = path.dirname(file)
+    try {
+      return parseJsonc(substituteConfigText(text, dir))
+    } catch {
+      return parseJsonc(substituteConfigText(text, dir, true))
+    }
+  } catch {
+    return undefined
+  }
+}
+
 // --- model refs ------------------------------------------------------------
 
 /**
@@ -206,12 +316,29 @@ export function modelDisplay(value: unknown): string | undefined {
 
 // --- agent markdown --------------------------------------------------------
 
+export type AgentRequest = {
+  headers?: Record<string, string>
+  body?: Record<string, unknown>
+}
+
+/**
+ * One agent the profile wants live, whatever declared it: an `agents` entry in
+ * opencode.jsonc or a markdown file. The fields mirror the native
+ * ConfigAgent.Info / Agent.Info contract; the transform applies the ones that
+ * exist.
+ */
 export type AgentDefinition = {
   name: string
   description?: string
   mode?: string
   model?: string
   system?: string
+  hidden?: boolean
+  color?: string
+  steps?: number
+  disabled?: boolean
+  permissions?: PermissionRule[]
+  request?: AgentRequest
   /** Per-agent generation tuning, applied at runtime via the context hook. */
   temperature?: number
   reasoningEffort?: string
@@ -226,66 +353,259 @@ export function agentMode(value: string | undefined): AgentMode | undefined {
   return value && (AGENT_MODES as Set<string>).has(value) ? (value as AgentMode) : undefined
 }
 
-/**
- * Read top-level scalar keys from YAML frontmatter plus the body as the prompt.
- * Nested blocks (permission trees) are skipped: Agent.Info has no shape here
- * that we can build from docs alone, and the profile's top-level `permissions`
- * array is enforced instead.
- */
-export function parseAgentMarkdown(name: string, text: string): AgentDefinition {
-  const lines = text.replace(/\r\n/g, "\n").split("\n")
-  const out: AgentDefinition = { name }
-  if (lines[0]?.trim() !== "---") return { ...out, system: text.trim() || undefined }
+function asString(value: unknown): string | undefined {
+  return typeof value === "string" && value !== "" ? value : undefined
+}
 
-  const scalars = new Map<string, string>()
+function asNumber(value: unknown): number | undefined {
+  const parsed = typeof value === "number" ? value : typeof value === "string" && value !== "" ? Number(value) : NaN
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
+/** `Agent.Info.steps` is a positive integer; anything else would be rejected. */
+function asPositiveInt(value: unknown): number | undefined {
+  const parsed = asNumber(value)
+  return parsed !== undefined && Number.isInteger(parsed) && parsed > 0 ? parsed : undefined
+}
+
+function asRequest(value: unknown): AgentRequest | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
+  const { headers, body } = value as Record<string, unknown>
+  const out: AgentRequest = {}
+  if (headers && typeof headers === "object" && !Array.isArray(headers)) {
+    const entries = Object.entries(headers as Record<string, unknown>).filter(
+      (entry): entry is [string, string] => typeof entry[1] === "string",
+    )
+    if (entries.length) out.headers = Object.fromEntries(entries)
+  }
+  if (body && typeof body === "object" && !Array.isArray(body)) out.body = body as Record<string, unknown>
+  return out.headers || out.body ? out : undefined
+}
+
+/** Case-insensitive key lookup for frontmatter written in either V1 or V2 casing. */
+function pick(data: Record<string, unknown>, ...names: string[]): unknown {
+  for (const name of names) {
+    if (data[name] !== undefined) return data[name]
+  }
+  const lower = new Map(Object.keys(data).map((key) => [key.toLowerCase(), key]))
+  for (const name of names) {
+    const key = lower.get(name.toLowerCase())
+    if (key !== undefined) return data[key]
+  }
+  return undefined
+}
+
+/**
+ * Map a native agent shape (config entry or markdown frontmatter) onto the
+ * fields the overlay can apply. Unknown keys are ignored, exactly as core does.
+ */
+function agentFromData(name: string, data: Record<string, unknown>, primary = false): AgentDefinition {
+  const definition: AgentDefinition = { name }
+
+  const description = asString(data.description)
+  if (description) definition.description = description
+
+  const mode = primary ? "primary" : asString(pick(data, "mode", "permission_mode"))
+  if (mode) definition.mode = mode
+
+  let model = modelDisplay(data.model)
+  const variant = asString(data.variant)
+  if (model && !model.includes("#") && variant) model = `${model}#${variant}`
+  if (model) definition.model = model
+
+  // The markdown body is the prompt. A frontmatter `system` or the legacy
+  // `prompt` is the fallback when the body is empty.
+  const system = asString(data.system) ?? asString(data.prompt)
+  if (system) definition.system = system
+
+  if (typeof data.hidden === "boolean") definition.hidden = data.hidden
+  const color = asString(data.color)
+  if (color) definition.color = color
+  const steps = asPositiveInt(data.steps)
+  if (steps !== undefined) definition.steps = steps
+  if (typeof data.disabled === "boolean") definition.disabled = data.disabled
+
+  const permissions = toPermissionRules(data.permissions)
+  if (permissions.length) definition.permissions = permissions
+
+  const request = asRequest(data.request)
+  if (request) definition.request = request
+
+  const temperature = asNumber(pick(data, "temperature"))
+  if (temperature !== undefined) definition.temperature = temperature
+  const reasoningEffort = asString(pick(data, "reasoningEffort", "reasoning_effort"))
+  if (reasoningEffort) definition.reasoningEffort = reasoningEffort
+  const textVerbosity = asString(pick(data, "textVerbosity", "text_verbosity"))
+  if (textVerbosity) definition.textVerbosity = textVerbosity
+
+  return definition
+}
+
+/**
+ * Read the YAML frontmatter the way core's `ConfigMarkdown` does: the body is
+ * the prompt, and every native agent field is honoured. A malformed document
+ * still yields its body, so one bad frontmatter cannot hide the agent.
+ */
+export function parseAgentMarkdown(name: string, text: string, options: { primary?: boolean } = {}): AgentDefinition {
+  const normalized = text.replace(/\r\n/g, "\n")
+  const lines = normalized.split("\n")
+  if (lines[0]?.trim() !== "---") {
+    return { name, system: normalized.trim() || undefined }
+  }
+
   let end = -1
-  let indent = 0
   for (let i = 1; i < lines.length; i++) {
-    const line = lines[i]
-    if (line.trim() === "---") {
+    if (lines[i].trim() === "---") {
       end = i
       break
     }
-    const leading = line.length - line.trimStart().length
-    if (leading === 0) {
-      const match = /^([A-Za-z0-9_-]+)\s*:\s*(.*)$/.exec(line)
-      if (match) {
-        const value = match[2].trim()
-        if (value === "" || value === "|" || value === ">") indent = 1
-        else {
-          indent = 0
-          scalars.set(match[1].toLowerCase(), value.replace(/^["']|["']$/g, ""))
-        }
-      }
-    } else if (indent === 0 && leading === 0) indent = 0
   }
-  const body = end === -1 ? text : lines.slice(end + 1).join("\n")
-  const temperature = scalars.get("temperature")
-  const parsed = temperature !== undefined && temperature !== "" ? Number(temperature) : undefined
-  return {
-    name,
-    description: scalars.get("description"),
-    mode: scalars.get("mode") ?? scalars.get("permission_mode"),
-    model: scalars.get("model"),
-    system: body.trim() || undefined,
-    temperature: parsed !== undefined && Number.isFinite(parsed) ? parsed : undefined,
-    reasoningEffort: scalars.get("reasoningeffort"),
-    textVerbosity: scalars.get("textverbosity"),
+  if (end === -1) return { name, system: normalized.trim() || undefined }
+
+  const frontmatter = lines.slice(1, end).join("\n")
+  const body = lines.slice(end + 1).join("\n").trim()
+  let data: Record<string, unknown> = {}
+  try {
+    const parsed = parseYaml(frontmatter)
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) data = parsed as Record<string, unknown>
+  } catch {
+    // Fall back to the scalar reader so a frontmatter quirk (an unquoted colon,
+    // a leading tag) still yields the fields it can read.
+    data = parseFrontmatterScalars(frontmatter)
   }
+
+  const definition = agentFromData(name, data, options.primary === true)
+  if (body) definition.system = body
+  return definition
 }
 
+/** Minimal top-level scalar reader used only when YAML parsing fails. */
+function parseFrontmatterScalars(frontmatter: string): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  for (const line of frontmatter.split("\n")) {
+    if (line.length === 0 || /^\s/.test(line)) continue
+    const match = /^([A-Za-z0-9_-]+)\s*:\s*(.*)$/.exec(line)
+    if (!match) continue
+    const value = match[2].trim()
+    if (value === "" || value === "|" || value === ">" || value.startsWith("[")) continue
+    out[match[1]] = value.replace(/^["']|["']$/g, "")
+  }
+  return out
+}
+
+/**
+ * Every markdown file under `dir`, recursively. `seen` holds real paths, so a
+ * symlink loop cannot recurse until the stack overflows — a profile that would
+ * not load is worse than one missing an agent.
+ */
+function markdownFiles(dir: string, seen = new Set<string>()): string[] {
+  let real: string
+  try {
+    real = fs.realpathSync.native(dir)
+  } catch {
+    real = dir
+  }
+  if (seen.has(real)) return []
+  seen.add(real)
+
+  let entries: fs.Dirent[]
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return []
+  }
+  const out: string[] = []
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name)
+    let directory = entry.isDirectory()
+    if (entry.isSymbolicLink()) {
+      try {
+        directory = fs.statSync(full).isDirectory()
+      } catch {
+        continue
+      }
+    }
+    if (directory) out.push(...markdownFiles(full, seen))
+    else if (entry.isFile() && entry.name.endsWith(".md")) out.push(full)
+  }
+  return out
+}
+
+/**
+ * Agent markdown sources, in core's order: `agent/` and `agents/` are ordinary
+ * agents, `mode/` and `modes/` force `mode: primary`. Files nest, and the name
+ * is the path below the source directory (`agents/team/reviewer.md` is
+ * `team/reviewer`). `.opencode/` is read too, so a profile can carry a
+ * project-style tree.
+ */
+const AGENT_SOURCES = [
+  { root: "agent", primary: false },
+  { root: "agents", primary: false },
+  { root: "mode", primary: true },
+  { root: "modes", primary: true },
+  { root: path.join(".opencode", "agent"), primary: false },
+  { root: path.join(".opencode", "agents"), primary: false },
+  { root: path.join(".opencode", "mode"), primary: true },
+  { root: path.join(".opencode", "modes"), primary: true },
+] as const
+
 export function readAgents(directory: string): AgentDefinition[] {
-  const agents: AgentDefinition[] = []
-  for (const root of ["agents", path.join(".opencode", "agents")]) {
-    const dir = path.join(directory, root)
-    if (!fs.existsSync(dir)) continue
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      if (!entry.isFile() || !entry.name.endsWith(".md")) continue
-      const text = fs.readFileSync(path.join(dir, entry.name), "utf8")
-      agents.push(parseAgentMarkdown(entry.name.replace(/\.md$/, ""), text))
+  const byName = new Map<string, AgentDefinition>()
+  for (const source of AGENT_SOURCES) {
+    const root = path.join(directory, source.root)
+    for (const file of markdownFiles(root).sort()) {
+      const name = path.relative(root, file).replaceAll("\\", "/").replace(/\.md$/, "")
+      if (!name) continue
+      try {
+        byName.set(name, parseAgentMarkdown(name, fs.readFileSync(file, "utf8"), { primary: source.primary }))
+      } catch {
+        // Unreadable file: skip it rather than failing the whole profile.
+      }
     }
   }
-  return agents
+  return [...byName.values()]
+}
+
+/**
+ * Agents declared as `agents` keys in the profile config. This is the other
+ * native way to define an agent, and the only one that can carry a prompt
+ * through `{file:...}` without a markdown file.
+ */
+export function configAgents(config: any): AgentDefinition[] {
+  const agents = config?.agents
+  if (!agents || typeof agents !== "object" || Array.isArray(agents)) return []
+  const out: AgentDefinition[] = []
+  for (const [name, value] of Object.entries(agents as Record<string, unknown>)) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue
+    out.push(agentFromData(name, value as Record<string, unknown>))
+  }
+  return out
+}
+
+/**
+ * Merge a config definition over a file definition, keeping defined fields.
+ * `permissions` and `request` accumulate instead of replacing: the file's rules
+ * stay in force and the config entry's are appended, so under last-match-wins
+ * the config entry still decides.
+ */
+export function mergeAgent(base: AgentDefinition | undefined, override: AgentDefinition): AgentDefinition {
+  if (!base) return override
+  const out: AgentDefinition = { ...base }
+  for (const [key, value] of Object.entries(override) as Array<[keyof AgentDefinition, unknown]>) {
+    if (value !== undefined) (out as Record<string, unknown>)[key] = value
+  }
+  if (base.permissions && override.permissions) {
+    out.permissions = [...base.permissions, ...override.permissions]
+  }
+  if (base.request && override.request) {
+    const headers = { ...base.request.headers, ...override.request.headers }
+    const body = { ...base.request.body, ...override.request.body }
+    out.request = {
+      ...(Object.keys(headers).length ? { headers } : {}),
+      ...(Object.keys(body).length ? { body } : {}),
+    }
+  }
+  return out
 }
 
 // --- permissions -----------------------------------------------------------
@@ -317,9 +637,23 @@ export function toPermissionRules(value: unknown): PermissionRule[] {
   return out
 }
 
+/**
+ * Compiled permission globs. `resolveEffect` runs on every tool decision, and a
+ * profile's rule set is static between switches, so compiling the same pattern
+ * once per decision is wasted work. The cache is bounded because patterns come
+ * from user config: a pathological profile must not grow it without limit.
+ */
+const globCache = new Map<string, RegExp>()
+const GLOB_CACHE_LIMIT = 256
+
 function globToRegExp(pattern: string): RegExp {
+  const cached = globCache.get(pattern)
+  if (cached) return cached
   const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")
-  return new RegExp(`^${escaped}$`)
+  const compiled = new RegExp(`^${escaped}$`)
+  if (globCache.size >= GLOB_CACHE_LIMIT) globCache.clear()
+  globCache.set(pattern, compiled)
+  return compiled
 }
 
 function matches(pattern: string, value: string): boolean {
@@ -435,7 +769,7 @@ export function websearchSelection(config: any): string | false | undefined {
 // so nothing is silently applied or silently dropped.
 //
 // Source of truth: the Config contract the server itself serves
-// (`opencode api get /openapi.json` -> Config.Info, 30 properties in 2.2.7)
+// (`opencode api get /openapi.json` -> Config.Info, 29 keys + $schema in 2.3.0)
 // plus https://opencode.ai/v2/docs/config and /v2/docs/migrate-v1.
 
 /** Native V2 top-level keys. */
@@ -514,8 +848,10 @@ const V2_EXPERIMENTAL = new Set([
   "background_compaction",
   "codemode_vm",
   "console_watches",
+  "mcp_events",
   "media_blob",
   "schedules",
+  "shell_timeout_background",
   "todo",
 ])
 const LEGACY_EXPERIMENTAL: Record<string, string> = {
@@ -706,7 +1042,7 @@ export type Profile = {
  * Keys that need a restart are read once when a server starts. A profile
  * directory is not a launch target (`opencode <dir>` opens a *project*), but the
  * server does read one extra config document from `OPENCODE_CONFIG`, merged
- * above the global and project config — verified against a running 2.2.7 server.
+ * above the global and project config — verified against a running 2.3.0 server.
  * So restarting the service with `OPENCODE_CONFIG=<profile>/opencode.jsonc`
  * applies the whole profile, including `plugins` and `providers`.
  *
@@ -721,9 +1057,28 @@ export function restartCommand(configFile: string | null): string {
     : "opencode service restart"
 }
 
+/**
+ * Canonical form of a config path for comparison. A service can be started with
+ * a symlinked, relative or `~`-spelled path; comparing raw strings leaves the
+ * restart marker stuck even though the layer is live.
+ */
+export function canonicalConfigPath(value: string): string {
+  const expanded = expandHome(value.trim())
+  const absolute = path.resolve(expanded)
+  try {
+    return fs.realpathSync.native(absolute)
+  } catch {
+    return absolute
+  }
+}
+
+function sameConfigPath(a: string, b: string): boolean {
+  return canonicalConfigPath(a) === canonicalConfigPath(b)
+}
+
 export function startupInfo(configFile: string, relaunch: string[], env?: string): StartupInfo {
   if (relaunch.length === 0) return { kind: "none", keys: [] }
-  if (env !== undefined && env !== "" && path.resolve(env) === path.resolve(configFile))
+  if (env !== undefined && env.trim() !== "" && sameConfigPath(env, configFile))
     return { kind: "layered", keys: relaunch }
   return { kind: "pending", keys: relaunch, command: restartCommand(configFile) }
 }
@@ -737,8 +1092,7 @@ export function layeredProfileName(
   env?: string,
 ): string | null {
   if (!env || env.trim() === "") return null
-  const target = path.resolve(env)
-  return profiles.find((profile) => path.resolve(profile.configFile) === target)?.name ?? null
+  return profiles.find((profile) => sameConfigPath(profile.configFile, env))?.name ?? null
 }
 
 /**
@@ -752,11 +1106,12 @@ export function staleAgentNames(
   profiles: Array<{ declaredAgents: string[] }>,
   active?: { declaredAgents: string[] },
 ): string[] {
-  const owned = new Set(active?.declaredAgents ?? [])
+  const seen = new Set(active?.declaredAgents ?? [])
   const out: string[] = []
   for (const profile of profiles) {
     for (const name of profile.declaredAgents) {
-      if (owned.has(name) || out.includes(name)) continue
+      if (seen.has(name)) continue
+      seen.add(name)
       out.push(name)
     }
   }
@@ -842,7 +1197,7 @@ const CONFIG_NAMES = ["opencode.jsonc", "opencode.json"]
  */
 export function readBaseConfig(): any | undefined {
   for (const name of CONFIG_NAMES) {
-    const parsed = readJsonc(path.join(globalConfigDir(), name))
+    const parsed = readConfigJsonc(path.join(globalConfigDir(), name))
     if (parsed && typeof parsed === "object") return parsed
   }
   return undefined
@@ -867,7 +1222,9 @@ export function loadProfiles(options: { includeHidden?: boolean } = {}): Profile
     const file = CONFIG_NAMES.map((name) => path.join(directory, name)).find((name) => fs.existsSync(name))
     if (!file) continue
 
-    const config = readJsonc(file)
+    // `{env:}` / `{file:}` substitution matches core, so an agent prompt can
+    // live in prompts/<name>.md and still reach the transform as text.
+    const config = readConfigJsonc(file)
     if (!config || typeof config !== "object") continue
 
     // Optional picker metadata; remove it to fall back to the derived summary.
@@ -875,10 +1232,17 @@ export function loadProfiles(options: { includeHidden?: boolean } = {}): Profile
 
     // V2 shapes only (opencode.ai/v2/docs/agents, /v2/docs/config). Anything in
     // a V1 shape is not read here; classifyConfig reports it instead.
-    const agents: Record<string, any> = config.agents ?? {}
     const warnings = classifyConfig(config)
-    const agentFiles = readAgents(directory)
-    const declaredAgents = [...new Set([...agentFiles.map((definition) => definition.name), ...Object.keys(agents)])]
+    // Both native sources: markdown files and `agents` keys in the config. A
+    // config entry wins per field, so a profile can ship the prompt as a file
+    // and override just its model in opencode.jsonc.
+    const merged = new Map<string, AgentDefinition>()
+    for (const definition of readAgents(directory)) merged.set(definition.name, definition)
+    for (const definition of configAgents(config)) {
+      merged.set(definition.name, mergeAgent(merged.get(definition.name), definition))
+    }
+    const agents = [...merged.values()]
+    const declaredAgents = agents.map((definition) => definition.name)
 
     found.push({
       name: entry.name,
@@ -888,14 +1252,12 @@ export function loadProfiles(options: { includeHidden?: boolean } = {}): Profile
       directory,
       configFile: file,
       config,
-      agents: agentFiles,
+      agents,
       declaredAgents,
-      disabledAgents: Object.entries(agents)
-        .filter(([, agent]) => agent?.disabled === true)
-        .map(([name]) => name),
-      agentModels: Object.entries(agents)
-        .map(([name, agent]) => ({ agent: name, model: modelDisplay(agent?.model) }))
-        .filter((entry): entry is { agent: string; model: string } => entry.model !== undefined),
+      disabledAgents: agents.filter((definition) => definition.disabled).map((definition) => definition.name),
+      agentModels: agents
+        .filter((definition) => definition.model !== undefined)
+        .map((definition) => ({ agent: definition.name, model: definition.model as string })),
       defaultAgent: typeof config.default_agent === "string" ? config.default_agent : undefined,
       defaultModel: modelDisplay(config.model),
       permissions: toPermissionRules(config.permissions),
