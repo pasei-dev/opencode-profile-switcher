@@ -20,12 +20,12 @@
   "keywords": ["opencode", "opencode-plugin", "profile", "config", "tui", "desktop"],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Nejrup/opencode-profile-switcher.git"
+    "url": "git+https://github.com/pasei-dev/opencode-profile-switcher.git"
   },
   "bugs": {
-    "url": "https://github.com/Nejrup/opencode-profile-switcher/issues"
+    "url": "https://github.com/pasei-dev/opencode-profile-switcher/issues"
   },
-  "homepage": "https://github.com/Nejrup/opencode-profile-switcher#readme",
+  "homepage": "https://github.com/pasei-dev/opencode-profile-switcher#readme",
   "dependencies": {
     "@opencode/plugin": "^2.3.0",
     "@opencode/schema": "^2.3.0",
