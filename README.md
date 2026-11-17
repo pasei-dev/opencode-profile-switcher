@@ -1,27 +1,19 @@
+<div align="center">
+
 # opencode-profile-switcher
 
-**Flip OpenCode between whole setups — models, agents, permissions, MCP servers — without editing config or restarting by hand.**
+**Flip OpenCode between whole setups — models, agents, permissions, MCP servers — with one key.**
 
-You keep one folder per setup: a cheap-and-fast one, a research one with its own
-agents, a locked-down one for production repos. Then you press one key and the
-whole thing changes.
+Keep one folder per setup: a cheap-and-fast one, a research one with its own agents, a locked-down one for production repos. Pick it and the whole thing changes.
+
+![OpenCode 2.3+](https://img.shields.io/badge/OpenCode-2.3%2B-black)
+![license: MIT](https://img.shields.io/badge/license-MIT-black)
+
+</div>
+
+A profile is a real config layer, not a partial overlay. The live keys apply the moment you pick it; the startup-only keys are restored by a restart that the plugin queues for you. The terminal and the desktop app share one server and one handoff file, so they always agree.
 
 ![The profile picker in the terminal](docs/tui.png)
-
-That is the terminal picker: `<leader>p`, or `/profile`, or the command palette.
-The footer keeps the active profile in view, with `⟳` when it still needs a
-restart and `✓` once it is fully loaded.
-
-The desktop app shows the same list, from the same server:
-
-![The profile picker in the desktop app](docs/desktop.png)
-
-Titlebar pill, project menu, command palette, and Settings › Profiles — all in
-sync with the terminal, because the server is the only thing holding the state.
-
-OpenCode **2.3.0+**. MIT. No OpenCode config is rewritten: the plugin keeps a
-small handoff file, and records the layer in the service config's `env` so the
-next start comes back layered.
 
 ## Install
 
@@ -37,19 +29,12 @@ Clone this repo somewhere permanent, then point `plugins` at the checkout:
 opencode service restart
 ```
 
-One entry loads every part — server, terminal UI, desktop UI. Check it landed:
+One entry loads every part — server, terminal UI, desktop UI.
 
-```sh
-opencode plugin list     # profile-switcher, source: your path
-opencode plugin check    # server and TUI rows side by side
-```
+> [!NOTE]
+> `opencode plugin add` on 2.3.0 takes npm and Git specs only, and the Git path is broken (`Unrecognized flag: --force`). An absolute path needs no installer and hot-reloads while you edit.
 
-> **Why not `opencode plugin add`?** On 2.3.0 it takes npm and Git specs only,
-> and the Git path is broken (`Unrecognized flag: --force in command opencode`).
-> An absolute path needs no installer, and it hot-reloads while you edit.
-
-If the desktop app does not show the pill yet, relaunch it once so its main
-process re-reads the plugin list.
+If the desktop app does not show the pill yet, relaunch it once so its main process re-reads the plugin list.
 
 ## Make a profile
 
@@ -59,11 +44,9 @@ A profile is a folder with an `opencode.jsonc` in it:
 ~/.config/opencode/profiles/
 └── deep/
     ├── opencode.jsonc        ← the overlay
-    ├── profile.jsonc         ← optional label + description for the picker
+    ├── profile.jsonc         ← optional label + description
     ├── prompts/              ← optional, pulled in with {file:…}
-    │   └── architect.md
     └── agents/               ← optional markdown agents
-        └── explorer.md
 ```
 
 ```jsonc title="~/.config/opencode/profiles/deep/opencode.jsonc"
@@ -80,28 +63,17 @@ A profile is a folder with an `opencode.jsonc` in it:
     { "action": "edit", "resource": "**", "effect": "deny" },
     { "action": "shell", "resource": "git push *", "effect": "ask" },
   ],
-  "mcp": {
-    "servers": { "docs": { "type": "remote", "url": "https://mcp.example.com" } },
-  },
-  "references": {
-    "handbook": { "path": "../shared/docs", "description": "Product behaviour" },
-  },
+  "mcp": { "servers": { "docs": { "type": "remote", "url": "https://mcp.example.com" } } },
+  "references": { "handbook": { "path": "../shared/docs", "description": "Product behaviour" } },
   "websearch": { "provider": "random" },
 }
 ```
 
-Agents work both ways, and both are read live: `agents` keys in the config (the
-only way to carry a prompt without a file, via `{file:}`), or markdown under
-`agent/`, `agents/`, `mode/` or `modes/` — nested folders become `team/reviewer`,
-and `mode/` files are always primary. A config entry wins per field, so the
-prompt can live in a file while the config overrides just its model.
+Agents work both ways, and both are read live: `agents` keys in the config (the only way to carry a prompt without a file, via `{file:}`), or markdown under `agent/`, `agents/`, `mode/` or `modes/` — nested folders become `team/reviewer`, and `mode/` files are always primary. A config entry wins per field, so the prompt can live in a file while the config overrides just its model.
 
-`model` also takes the object form
-`{ "providerID": "anthropic", "model": "claude-opus-4-7", "variant": "high" }`,
-and so does `agents.<name>.model`.
+`model` also takes the object form `{ "providerID": "anthropic", "model": "claude-opus-4-7", "variant": "high" }`, and so does `agents.<name>.model`.
 
-`profile.jsonc` is cosmetic — drop it and the picker derives a summary from
-`default_agent` and `model`:
+`profile.jsonc` is cosmetic — drop it and the picker derives a summary from `default_agent` and `model`:
 
 ```jsonc
 { "label": "deep", "description": "architect + explorer, edits denied" }
@@ -126,7 +98,7 @@ Three worth starting with:
 | `/profile <name>` | Apply one — matches name or label, case-insensitive |
 | `/profile none` | Back to base config |
 | `/profile prev` | Back to the one before |
-| `/profile list` | The text report: active profile, every profile, what was ignored |
+| `/profile list` | Active profile, every profile, what was ignored |
 | `/profile restart` | Print the exact restart command |
 | `/profile policy ask\|always\|never` | Set the shared restart policy |
 | Palette | "Switch profile", "Restart service with profile", "Profile restart policy: …" |
@@ -152,33 +124,16 @@ Most of a profile applies the moment you pick it:
 | `permissions` | evaluated on every tool call, last match wins |
 | agent `temperature`, `reasoningEffort`, `textVerbosity` | applied on the next request |
 
-Agents a profile retires are **hidden, never removed** — a session still bound to
-one would otherwise die on its next turn. Visibility is derived fresh on every
-switch, so dropping a profile brings the originals back exactly as configured.
+Agents a profile retires are **hidden, never removed** — a session still bound to one would otherwise die on its next turn. Visibility is derived fresh on every switch, so dropping a profile brings the originals back exactly as configured.
 
 ### About twenty keys need a restart
 
-`plugins`, `providers`, `compaction`, `lsp`, `formatter`, `skills`, `commands`,
-`experimental`, `snapshots`, `worktree`, `shell` and friends are read once when
-the server starts. No plugin can change them in a running process.
+`plugins`, `providers`, `compaction`, `lsp`, `formatter`, `skills`, `commands`, `experimental`, `snapshots`, `worktree`, `shell` and friends are read once when the server starts. No plugin can change them in a running process, so the profile is layered in through `OPENCODE_CONFIG` and the service is restarted.
 
-So this one restarts the service *with the profile layered in* — the server reads
-one extra config document from `OPENCODE_CONFIG`, merged above your global
-config. That makes a profile a real config layer, not a partial overlay.
-
-- Profiles with such keys show **`⟳ needs restart`**; after the restart they show
-  **`✓ startup loaded`**.
-- The layer is written into the service config's `env` (`service.json`), which
-  the CLI reads whenever it spawns a daemon. A cold start or a manual
-  `opencode service restart` therefore comes back layered with no relay. The
-  desktop app starts its own server with its own env and ignores that file, so
-  after it drops the layer the plugin restores it once, guarded by a shared
-  attempt budget (three tries, ten minutes apart).
-- By default it restarts on every switch, and **never on top of a running turn**:
-  the TUI queues it until the session goes idle, the desktop app polls the
-  server's `busy` flag and restarts from its main process.
-- Sessions and history live in the database, so they survive. The app reconnects
-  on its own; if your terminal does not, relaunch `opencode`.
+- Profiles with such keys show **`⟳ needs restart`**; after the restart they show **`✓ startup loaded`**.
+- The layer is written into the service config's `env` (`service.json`), which the CLI reads whenever it spawns a daemon. A cold start or a manual `opencode service restart` therefore comes back layered with no relay. The desktop app starts its own server with its own env and ignores that file, so after it drops the layer the plugin restores it once, guarded by a shared attempt budget (three tries, ten minutes apart).
+- By default it restarts on every switch, and **never on top of a running turn**: the TUI queues it until the session goes idle, the desktop app polls the server's `busy` flag and restarts from its main process.
+- Sessions and history live in the database, so they survive. The app reconnects on its own; if your terminal does not, relaunch `opencode`.
 
 Three policies, shared by both clients:
 
@@ -188,17 +143,15 @@ Three policies, shared by both clients:
 | **ask** | `⟳` marker plus a confirmation dialog |
 | **never** | marker and a toast with the command; you restart yourself |
 
-Change it from the palette (**"Profile restart policy: …"**) or Settings ›
-Profiles. Prefer one project permanently pinned to a profile? Symlink it:
+Change it from the palette (**"Profile restart policy: …"**) or Settings › Profiles. Prefer one project permanently pinned to a profile? Symlink it:
 
 ```sh
 ln -s ~/.config/opencode/profiles/deep/opencode.jsonc ~/work/repo/opencode.jsonc
 ```
 
-## When something looks off
+## Troubleshooting
 
-Switching never silently drops a field. `/profile list` prints what it did with
-each key:
+Switching never silently drops a field. `/profile list` prints what it did with each key:
 
 ```text
 **deep** — `…/profiles/deep`
@@ -206,9 +159,6 @@ each key:
 - applied live: agents, default_agent, mcp, model, permissions, references
 - ⟳ needs a restart — compaction are read when the server starts:
     OPENCODE_CONFIG="…/profiles/deep/opencode.jsonc" opencode service restart
-- legacy fields (ignored by V2):
-    - agent — rename to "agents"
-    - permission — rename to "permissions" (array of { action, resource, effect })
 ```
 
 | Symptom | Fix |
@@ -224,18 +174,10 @@ each key:
 
 ## Limits
 
-- **The overlay is global.** One handoff file in the config dir, so a switch
-  applies to every location the service has loaded.
-- **Startup-bound keys cost a bounce.** The restart is deferred while a turn
-  runs, but it does interrupt the next one.
-- **The layer lives in the service's environment.** Other `opencode` commands you
-  start yourself need `OPENCODE_CONFIG` too. If the desktop app starts its own
-  server, the layer drops — the clients put it back on their next refresh, a few
-  times, then leave the marker and the command.
-- **Permissions tighten, never loosen.** The hook runs after your configured
-  ruleset, and an explicit `deny` is final.
-- **The desktop part is experimental** (`./gui-experimental`), so a future app
-  release may move it.
+- **The overlay is global.** One handoff file in the config dir, so a switch applies to every location the service has loaded.
+- **Startup-bound keys cost a bounce.** The restart is deferred while a turn runs, but it does interrupt the next one.
+- **Permissions tighten, never loosen.** The hook runs after your configured ruleset, and an explicit `deny` is final.
+- **The desktop part is experimental** (`./gui-experimental`), so a future app release may move it.
 
 ## Development
 
@@ -244,14 +186,4 @@ bun install
 bun run check    # typecheck + GUI bundle + tests
 ```
 
-`dist/gui-experimental.cjs` is committed on purpose: GitHub installs do not run a
-build, and the desktop app needs a prebuilt bundle. Rebuild it with any GUI
-change.
-
-Editing this checkout? `./install.sh` builds the bundle and prints the
-`plugins` entry; the loop is `src/` → `bun run build` → `opencode service
-restart`. Contract notes and live-server recipes are in [AGENTS.md](./AGENTS.md).
-
-## License
-
-MIT — see [LICENSE](./LICENSE).
+`dist/gui-experimental.cjs` is committed on purpose: GitHub installs do not run a build, and the desktop app needs a prebuilt bundle. Rebuild it with any GUI change. Contract notes and live-server recipes are in [AGENTS.md](./AGENTS.md).
