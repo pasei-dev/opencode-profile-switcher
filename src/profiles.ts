@@ -196,7 +196,7 @@ export function clearRelayer(): void {
  * The profile the handoff record says should be layered. `apply` writes the
  * record before the restart, so it outlives a service that comes back without
  * the layer (the desktop app starts its own server with its own environment).
- * Clients use it to put the layer back rather than leaving ⟳ stuck forever.
+ * Clients use it to put the layer back, so ⟳ does not stay stuck.
  */
 export function expectedLayered(state: SelectionState): string | null {
   return state.startup?.kind === "layered" ? state.profile : null
@@ -282,7 +282,7 @@ export function substituteConfigText(text: string, dir: string, escapeEnv = fals
     return escapeEnv ? JSON.stringify(value).slice(1, -1) : value
   })
   return withEnv.replace(/\{file:([^}]+)\}/g, (token, raw: string, offset: number, whole: string) => {
-    // A reference in a line comment is documentation, not a file to read.
+    // A reference in a line comment is documentation; leave it alone.
     const lineStart = whole.lastIndexOf("\n", offset - 1) + 1
     if (whole.slice(lineStart, offset).trimStart().startsWith("//")) return token
     const expanded = expandHome(raw)
@@ -604,7 +604,7 @@ export function readAgents(directory: string): AgentDefinition[] {
       try {
         byName.set(name, parseAgentMarkdown(name, fs.readFileSync(file, "utf8"), { primary: source.primary }))
       } catch {
-        // Unreadable file: skip it rather than failing the whole profile.
+        // Unreadable file: skip it, so one bad profile does not fail the rest.
       }
     }
   }

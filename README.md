@@ -2,7 +2,7 @@
 
 # opencode-profile-switcher
 
-**Flip OpenCode between whole setups — models, agents, permissions, MCP servers — with one key.**
+**Flip OpenCode between whole setups with one key: models, agents, permissions, MCP servers.**
 
 Keep one folder per setup: a cheap-and-fast one, a research one with its own agents, a locked-down one for production repos. Pick it and the whole thing changes.
 
@@ -11,7 +11,7 @@ Keep one folder per setup: a cheap-and-fast one, a research one with its own age
 
 </div>
 
-A profile is a real config layer, not a partial overlay. The live keys apply the moment you pick it; the startup-only keys are restored by a restart that the plugin queues for you. The terminal and the desktop app share one server and one handoff file, so they always agree.
+A profile is a full config layer. The live keys apply the moment you pick it; the startup-only keys are restored by a restart that the plugin queues for you. The terminal and the desktop app share one server and one handoff file, so they always agree.
 
 ![The profile picker in the terminal](docs/tui.png)
 
@@ -29,7 +29,7 @@ Clone this repo somewhere permanent, then point `plugins` at the checkout:
 opencode service restart
 ```
 
-One entry loads every part — server, terminal UI, desktop UI.
+One entry loads every part: server, terminal UI, desktop UI.
 
 > [!NOTE]
 > `opencode plugin add` on 2.3.0 takes npm and Git specs only, and the Git path is broken (`Unrecognized flag: --force`). An absolute path needs no installer and hot-reloads while you edit.
@@ -69,11 +69,11 @@ A profile is a folder with an `opencode.jsonc` in it:
 }
 ```
 
-Agents work both ways, and both are read live: `agents` keys in the config (the only way to carry a prompt without a file, via `{file:}`), or markdown under `agent/`, `agents/`, `mode/` or `modes/` — nested folders become `team/reviewer`, and `mode/` files are always primary. A config entry wins per field, so the prompt can live in a file while the config overrides just its model.
+Agents work both ways, and both are read live: `agents` keys in the config (the only way to carry a prompt without a file, via `{file:}`), or markdown under `agent/`, `agents/`, `mode/` or `modes/`. Nested folders become `team/reviewer`, and `mode/` files are always primary. A config entry wins per field, so the prompt can live in a file while the config overrides just its model.
 
 `model` also takes the object form `{ "providerID": "anthropic", "model": "claude-opus-4-7", "variant": "high" }`, and so does `agents.<name>.model`.
 
-`profile.jsonc` is cosmetic — drop it and the picker derives a summary from `default_agent` and `model`:
+`profile.jsonc` is cosmetic: drop it and the picker derives a summary from `default_agent` and `model`:
 
 ```jsonc
 { "label": "deep", "description": "architect + explorer, edits denied" }
@@ -95,7 +95,7 @@ Three worth starting with:
 | --- | --- |
 | `<leader>p` | The picker (`ctrl+x` then `p` by default) |
 | `/profile` | The picker, too |
-| `/profile <name>` | Apply one — matches name or label, case-insensitive |
+| `/profile <name>` | Apply one, matching name or label, case-insensitive |
 | `/profile none` | Back to base config |
 | `/profile prev` | Back to the one before |
 | `/profile list` | Active profile, every profile, what was ignored |
@@ -124,7 +124,7 @@ Most of a profile applies the moment you pick it:
 | `permissions` | evaluated on every tool call, last match wins |
 | agent `temperature`, `reasoningEffort`, `textVerbosity` | applied on the next request |
 
-Agents a profile retires are **hidden, never removed** — a session still bound to one would otherwise die on its next turn. Visibility is derived fresh on every switch, so dropping a profile brings the originals back exactly as configured.
+Agents a profile retires are **hidden, never removed**: a session still bound to one would otherwise die on its next turn. Visibility is derived fresh on every switch, so dropping a profile brings the originals back exactly as configured.
 
 ### About twenty keys need a restart
 
@@ -139,7 +139,7 @@ Three policies, shared by both clients:
 
 | Policy | Behaviour |
 | --- | --- |
-| **always** *(default)* | every switch bounces the service with the new profile layered in — and switching back to base bounces it **without** the layer, so the plugins a profile added actually go away |
+| **always** *(default)* | every switch bounces the service with the new profile layered in, and switching back to base bounces it **without** the layer, so the plugins a profile added actually go away |
 | **ask** | `⟳` marker plus a confirmation dialog |
 | **never** | marker and a toast with the command; you restart yourself |
 
@@ -154,10 +154,10 @@ ln -s ~/.config/opencode/profiles/deep/opencode.jsonc ~/work/repo/opencode.jsonc
 Switching never silently drops a field. `/profile list` prints what it did with each key:
 
 ```text
-**deep** — `…/profiles/deep`
+**deep**: `…/profiles/deep`
 - default agent: `architect`
 - applied live: agents, default_agent, mcp, model, permissions, references
-- ⟳ needs a restart — compaction are read when the server starts:
+- ⟳ needs a restart: compaction are read when the server starts:
     OPENCODE_CONFIG="…/profiles/deep/opencode.jsonc" opencode service restart
 ```
 
@@ -166,11 +166,11 @@ Switching never silently drops a field. `/profile list` prints what it did with 
 | No `<leader>p`, no "Switch profile" | the plugin is not in `plugins`; add it and `opencode service restart` |
 | Listed, but no `/profile` | the server half is not loaded: `opencode api get /api/plugin` → `state: active` |
 | Desktop pill missing | `features.gui` must be `true` in that same response, and the plugin enabled in Settings › Extensions |
-| Picked a profile, nothing moved | it uses V1 keys (`agent:`, `permission:`) — `/profile list` names them |
+| Picked a profile, nothing moved | it uses V1 keys (`agent:`, `permission:`); `/profile list` names them |
 | Agents have no prompt | the entry has no `system` and there is no matching markdown file |
 | `⟳` stays after a restart | the service came back without the layer; under **always** the clients restore it, otherwise restart from the picker |
 | `could not restart the service` | the CLI is not the running binary (a wrapper or shim): set `OPENCODE_BIN` |
-| Terminal hangs after a restart | relaunch `opencode` — nothing is lost |
+| Terminal hangs after a restart | relaunch `opencode`; nothing is lost |
 
 ## Limits
 

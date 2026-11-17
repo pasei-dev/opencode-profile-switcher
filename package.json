@@ -1,7 +1,7 @@
 {
   "name": "opencode-profile-switcher",
   "version": "2.1.0",
-  "description": "Switch OpenCode config profiles live from the TUI or the desktop app — no config edits, no restart",
+  "description": "Switch OpenCode config profiles live from the TUI or the desktop app, with no config edits and no restart",
   "type": "module",
   "license": "MIT",
   "exports": {

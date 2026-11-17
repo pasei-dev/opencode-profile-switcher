@@ -168,7 +168,7 @@ export default Plugin.define({
     }
 
     // Move the requesting session onto the profile's default agent and model.
-    // Disabled agents are only hidden, so this never strands a session; it just
+    // Disabled agents are only hidden, so this never strands a session; it
     // points the session at the agent/model the profile intends.
     const migrateSession = async (sessionID?: string) => {
       if (!sessionID) return
