@@ -19,8 +19,9 @@ The desktop app shows the same list, from the same server:
 Titlebar pill, project menu, command palette, and Settings › Profiles — all in
 sync with the terminal, because the server is the only thing holding the state.
 
-OpenCode **2.3.0+**. MIT. No config is ever rewritten; the plugin keeps its own
-little handoff file and nothing else.
+OpenCode **2.3.0+**. MIT. No OpenCode config is rewritten: the plugin keeps a
+small handoff file, and records the layer in the service config's `env` so the
+next start comes back layered.
 
 ## Install
 
@@ -167,6 +168,12 @@ config. That makes a profile a real config layer, not a partial overlay.
 
 - Profiles with such keys show **`⟳ needs restart`**; after the restart they show
   **`✓ startup loaded`**.
+- The layer is written into the service config's `env` (`service.json`), which
+  the CLI reads whenever it spawns a daemon. A cold start or a manual
+  `opencode service restart` therefore comes back layered with no relay. The
+  desktop app starts its own server with its own env and ignores that file, so
+  after it drops the layer the plugin restores it once, guarded by a shared
+  attempt budget (three tries, ten minutes apart).
 - By default it restarts on every switch, and **never on top of a running turn**:
   the TUI queues it until the session goes idle, the desktop app polls the
   server's `busy` flag and restarts from its main process.

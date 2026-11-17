@@ -14,6 +14,7 @@ import {
   cliBinary,
   configAgents,
   claimRelayer,
+  clearRelayer,
   expectedLayered,
   layeredProfileName,
   loadProfiles,
@@ -33,6 +34,7 @@ import {
   restartEnv,
   resolveRestartPolicy,
   resolveEffect,
+  serviceConfigFile,
   staleAgentNames,
   startupInfo,
   startupLabel,
@@ -41,6 +43,7 @@ import {
   websearchSelection,
   writePolicy,
   writeSelection,
+  writeServiceEnv,
 } from "../src/profiles.ts"
 
 describe("parseModelRef", () => {
@@ -513,6 +516,55 @@ describe("shared selection state", () => {
       // Three attempts is the cap, however long the client waits.
       expect(claimRelayer("deep", 1_000 + RELAYER_COOLDOWN_MS * 10)).toBe(false)
       expect(readSelectionState().relayer).toMatchObject({ profile: "deep", attempts: RELAYER_ATTEMPTS })
+    })
+  })
+
+  test("writeServiceEnv keeps the layer in the service config and preserves the rest", () => {
+    withConfig(() => {
+      const file = serviceConfigFile()
+      fs.mkdirSync(path.dirname(file), { recursive: true })
+      fs.writeFileSync(file, JSON.stringify({ password: "secret", remote: { route: "abc" } }))
+
+      writeServiceEnv("/profiles/deep/opencode.jsonc")
+      const written = JSON.parse(fs.readFileSync(file, "utf8"))
+      expect(written.password).toBe("secret")
+      expect(written.remote).toEqual({ route: "abc" })
+      expect(written.env.OPENCODE_CONFIG).toBe("/profiles/deep/opencode.jsonc")
+
+      // A second call with the same value is a no-op, not a rewrite.
+      const before = fs.statSync(file).mtimeMs
+      writeServiceEnv("/profiles/deep/opencode.jsonc")
+      expect(fs.statSync(file).mtimeMs).toBe(before)
+
+      writeServiceEnv(null)
+      const cleared = JSON.parse(fs.readFileSync(file, "utf8"))
+      expect(cleared.env).toBeUndefined()
+      expect(cleared.password).toBe("secret")
+    })
+  })
+
+  test("writeServiceEnv leaves a malformed service config alone", () => {
+    withConfig(() => {
+      const file = serviceConfigFile()
+      fs.mkdirSync(path.dirname(file), { recursive: true })
+      fs.writeFileSync(file, "{ not json")
+      writeServiceEnv("/profiles/deep/opencode.jsonc")
+      expect(fs.readFileSync(file, "utf8")).toBe("{ not json")
+    })
+  })
+
+  test("clearRelayer gives the attempts back once the layer has stayed up", () => {
+    withConfig(() => {
+      writeSelection("deep", undefined, { kind: "layered", keys: ["plugins"] })
+      claimRelayer("deep", 1_000)
+      claimRelayer("deep", 1_000 + RELAYER_COOLDOWN_MS)
+      expect(readSelectionState().relayer?.attempts).toBe(2)
+
+      clearRelayer()
+      expect(readSelectionState().relayer).toBeUndefined()
+      // A fresh incident starts from zero again.
+      expect(claimRelayer("deep", 1_000 + RELAYER_COOLDOWN_MS * 2)).toBe(true)
+      expect(readSelectionState().relayer?.attempts).toBe(1)
     })
   })
 

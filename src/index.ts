@@ -19,6 +19,7 @@
 
 import fs from "node:fs"
 import path from "node:path"
+import { spawn } from "node:child_process"
 
 import { Plugin } from "@opencode/plugin"
 import { Agent } from "@opencode/schema"
@@ -28,6 +29,7 @@ import type { ProfileView, Snapshot } from "./types.ts"
 import {
   agentMode,
   claimRelayer,
+  clearRelayer,
   expectedLayered,
   globalConfigDir,
   layeredProfileName,
@@ -36,6 +38,7 @@ import {
   modelRefFromConfig,
   parseModelRef,
   profilesRoot,
+  RELAYER_ATTEMPTS,
   readBaseConfig,
   readSelection,
   readSelectionState,
@@ -48,8 +51,26 @@ import {
   websearchSelection,
   writePolicy,
   writeSelection,
+  writeServiceEnv,
   type Profile,
 } from "./profiles.ts"
+
+/**
+ * Restarts the background service with the profile layered. Detached, because the
+ * service this runs in is the one being replaced.
+ */
+function restartDetached(configFile: string): void {
+  try {
+    const child = spawn(process.execPath, ["service", "restart"], {
+      env: { ...process.env, OPENCODE_CONFIG: configFile },
+      detached: true,
+      stdio: "ignore",
+    })
+    child.unref()
+  } catch (error) {
+    console.warn("[profile-switcher] could not restart the service", error)
+  }
+}
 
 /** Which registry a profile key feeds, so a switch reloads only what changed. */
 const DOMAIN_KEYS: Record<string, string[]> = {
@@ -200,6 +221,10 @@ export default Plugin.define({
         sessionID,
         active ? startupInfo(active.configFile, active.warnings.relaunch, process.env.OPENCODE_CONFIG) : undefined,
       )
+      // Persist the layer where the CLI reads it at spawn time, so the next
+      // cold start or manual restart needs no relay. `none` removes it, or the
+      // next restart would put the old profile back.
+      writeServiceEnv(active?.configFile ?? null)
       await reloadDomains(new Set([...domainsFor(before), ...domainsFor(active)]))
       await migrateSession(sessionID)
       emitChanged?.()
@@ -251,6 +276,44 @@ export default Plugin.define({
       const startup = startupInfo(active.configFile, active.warnings.relaunch, process.env.OPENCODE_CONFIG)
       if (stored.profile !== active.name || stored.startup?.kind !== startup.kind) {
         writeSelection(active.name, stored.sessionID, startup)
+      }
+      // The layer stuck. Give back the relay attempts once it has stayed up a
+      // while, so a later drop can heal again. Waiting avoids resetting on the
+      // very boot the host is about to undo.
+      setTimeout(clearRelayer, 60_000).unref?.()
+      // Record the layer where the CLI reads it, so the next start needs no
+      // relay. Idempotent: a boot that already matches writes nothing.
+      writeServiceEnv(active.configFile)
+    }
+
+    // A manual restart, or the desktop app starting its own server, drops the
+    // OPENCODE_CONFIG layer: the profile comes back with its live keys applied and
+    // its startup keys silently missing. Put the layer back once, guarded by the
+    // shared relayer token so several locations cannot bounce the service.
+    //
+    // A "pending" record is the same failure seen from the other side: the switch
+    // asked for a restart and this boot is the one that came back without the
+    // layer. Clients only relay a "layered" record (a pending one may still be
+    // mid-restart), but at boot the restart is over.
+    const boot = readSelectionState()
+    const expected = expectedLayered(boot) ?? (boot.startup?.kind === "pending" ? boot.profile : null)
+    if (expected && bootLayered === null && expected === active?.name) {
+      const profile = profiles.find((item) => item.name === expected)
+      if (profile && claimRelayer(expected)) {
+        console.warn(
+          `[profile-switcher] the ${expected} layer is missing; restarting the service with ${profile.configFile}`,
+        )
+        // Let this server finish booting before the restart replaces it.
+        setTimeout(() => restartDetached(profile.configFile), 2_000)
+      } else if (profile) {
+        // Another location may have claimed the relay a moment ago; only speak
+        // when the attempts are spent and nobody will fix it.
+        const relayer = readSelectionState().relayer
+        if (relayer?.profile === expected && relayer.attempts >= RELAYER_ATTEMPTS) {
+          console.warn(
+            `[profile-switcher] the ${expected} layer is still missing; run: ${restartCommand(profile.configFile)}`,
+          )
+        }
       }
     }
 

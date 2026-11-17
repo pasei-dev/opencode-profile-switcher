@@ -20,6 +20,9 @@ describe("desktop GUI bundle", () => {
       "solid-js": await import("solid-js"),
       "solid-js/web": await import("solid-js/web"),
       "node:child_process": await import("node:child_process"),
+      "node:fs": await import("node:fs"),
+      "node:os": await import("node:os"),
+      "node:path": await import("node:path"),
     }
 
     const module = { exports: {} as Record<string, unknown> }

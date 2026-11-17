@@ -130,6 +130,38 @@ export function writePolicy(policy: RestartPolicy): void {
   writeState({ ...readSelectionState(), policy })
 }
 
+/** The service's own config, where the CLI keeps the env it spawns a daemon with. */
+export function serviceConfigFile(): string {
+  return path.join(globalConfigDir(), "service.json")
+}
+
+/**
+ * Keep the profile's layer in the service config's `env`. The CLI reads this
+ * file whenever it spawns a daemon, so a cold start or a manual
+ * `opencode service restart` layers the profile with no relay at all. The
+ * desktop app starts its own server and ignores this file, so it still relies
+ * on the boot relay.
+ *
+ * Other keys and other env vars are preserved; passing null removes only ours.
+ */
+export function writeServiceEnv(configFile: string | null): void {
+  const file = serviceConfigFile()
+  const exists = fs.existsSync(file)
+  const current = readJsonc(file)
+  if (exists && (!current || typeof current !== "object")) return
+  const base: Record<string, unknown> = current ?? {}
+  const env = { ...(base.env && typeof base.env === "object" ? (base.env as Record<string, unknown>) : {}) }
+  if (configFile) env.OPENCODE_CONFIG = configFile
+  else delete env.OPENCODE_CONFIG
+  const next: Record<string, unknown> = { ...base }
+  if (Object.keys(env).length > 0) next.env = env
+  else delete next.env
+  if (JSON.stringify(next) === JSON.stringify(base)) return
+  const temp = `${file}.${process.pid}.${Date.now()}.tmp`
+  fs.writeFileSync(temp, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 })
+  fs.renameSync(temp, file)
+}
+
 /**
  * Claim the right to restore a dropped layer. The handoff file is shared by
  * every client, so this is what stops two windows from bouncing the service at
@@ -145,6 +177,19 @@ export function claimRelayer(profile: string, now = Date.now()): boolean {
   if (!fresh && now - previous.at < RELAYER_COOLDOWN_MS) return false
   writeState({ ...state, relayer: { profile, at: now, attempts: attempts + 1 } })
   return true
+}
+
+/**
+ * Forget the attempts once the layer has proved it stays. A layered boot alone
+ * is not proof: the host that drops the layer restarts the service and drops it
+ * again seconds later, so clearing on boot would hand out a fresh set of
+ * attempts on every cycle. Callers clear after the layer has been live for a
+ * while, which is what makes a later drop heal without a loop.
+ */
+export function clearRelayer(): void {
+  const state = readSelectionState()
+  if (!state.relayer) return
+  writeState({ ...state, relayer: undefined })
 }
 
 /**
